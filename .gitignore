@@ -1,0 +1,45 @@
+# macOS System Files
+.DS_Store
+*.swp
+*~
+
+# Swift Package Manager & Builds
+/.build/
+/Packages/
+.swiftpm/
+
+# Xcode & Apple IDE State
+xcuserdata/
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+*.xcuserstate
+
+# Harness Runtime Logs & Session Artifacts (Agent-in-Agent Brain)
+/brain/
+brain/
+*.log
+results.log
+escalation_report_*.md
+
+# Backups & Temp/Scratch Directories
+*.bak
+/tmp/
+tmp/
+/scratch/
+scratch/
+/temp/
+temp/
+
+# Test Outputs & Coverage Data
+test_output/
+*.output
+*.profdata
+*.profraw
+
+# Development record (dated history/rationale, not tracked in git)
+KNOWN_ISSUES.md
+
+# Environment & Local Secrets
+.env
+.env.*
