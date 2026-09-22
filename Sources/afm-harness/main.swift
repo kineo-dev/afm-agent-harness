@@ -133,13 +133,17 @@ if let promptText = options.prompt {
             let session: String
             let brain_dir: String
             let metrics: Agent.Metrics
+            let clarification_requested: Bool
+            let clarification_question: String?
         }
         let env = JSONEnvelope(
             ok: !isError,
             answer: result,
             session: sessionId,
             brain_dir: sessionBrainDir,
-            metrics: metrics
+            metrics: metrics,
+            clarification_requested: agent.executor.clarificationRequested,
+            clarification_question: agent.executor.lastClarificationQuestion
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

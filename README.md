@@ -42,7 +42,7 @@ On Apple Silicon (M1, 16GB, macOS 27.0):
   - *Single-function refactoring*: Accurately performed targeted refactorings (e.g. replacing `str.split()` with `shlex.split()` and adding imports) without touching unrelated code.
   - *Complex multi-part edits*: Struggles with compound instructions requiring logic removal/relaxation (e.g. removing `html.escape` across multiple call sites while retaining table-cell pipe escaping); the model demonstrates a strong bias toward preserving existing safety/robustness logic against explicit removal instructions.
 - **Reflexive Tool-Calling**: When tools are registered in a session, the model reflexively invokes tools (like `read_file`) upon encountering file paths in prompt text, even under explicit negative instructions ("Do not use tools"). The `--no-tools` mode exists as an architectural separation to enable pure code-reasoning without tool interference.
-- **Context Window Budget (~4096 tokens)**: Reading full files larger than ~3000 characters rapidly overflows the context window when combined with system prompts and tool schemas. Reading must be scoped using `begin_line`/`end_line` or targeted search (`grep`/`rg`).
+- **Context Window Budget**: The safe full-file read limit scales with the detected on-device model tier -- approximately 3,000 characters on baseline hardware (~4096-token window) and up to ~7,000 characters on advanced-tier hardware. Reads exceeding the active budget, whether requested in full or via begin_line/end_line, are rejected with guidance to narrow the range or use search_files.
 
 ---
 
@@ -78,7 +78,7 @@ afm-agent-harness/
         ├── Agent.swift         # LanguageModelSession orchestrator, tool loop, forced synthesis
         ├── Executor.swift      # Sandboxed bash/read/write/edit implementations & brain logging
         ├── Approval.swift      # SAFE_PREFIXES auto-approval, shell operator inspection, scope gates
-        ├── Tools.swift         # FoundationModels Tool protocol definitions for the 4 core tools
+        ├── Tools.swift         # FoundationModels Tool protocol definitions for all built-in tools
         └── Triage.swift        # ModelTier detection and baseline/advanced triage classifier
 ```
 
@@ -98,6 +98,24 @@ afm-agent-harness/
 
 ---
 
+## Built-in Tools
+
+afm-harness registers the following tools with the LanguageModelSession:
+
+| Tool | Purpose | Key Arguments |
+| :--- | :--- | :--- |
+| `bash` | Execute a shell command under Approval gating | `command`, `description` |
+| `read_file` | Read a file, optionally scoped to a line range | `path`, `begin_line`, `end_line` |
+| `write_file` | Atomically create or overwrite a file | `path`, `content`, `dry_run` |
+| `edit_file` | Replace a unique string in a file, atomically with backup | `path`, `old_string`, `new_string`, `dry_run` |
+| `search_files` | Search file contents by regex or substring with an optional filename glob, without spawning a shell | `pattern`, `path`, `glob` |
+| `file_undo` | Revert a write_file or edit_file operation from earlier in the session | `operation_id`, `path` |
+| `clarify` | Ask the user a clarifying question, optionally with discrete choices, when instructions are ambiguous | `question`, `options`, `allow_multiple` |
+
+Passing `dry_run: true` to `write_file` or `edit_file` previews the change without touching disk.
+
+---
+
 ## Command-Line Usage
 
 ### Building on macOS
@@ -110,7 +128,7 @@ swift build -c release
 - `--scope <path>`: Restrict filesystem access and default working directory to `<path>`.
 - `--read-only`: Mechanically block `write_file`, `edit_file`, and any non-read-only bash commands.
 - `--no-tools`: Run in pure reasoning mode without registering tools to avoid reflexive tool calling.
-- `--json`: Output result as a JSON envelope containing answer, session UUID, brain path, and metrics.
+- `--json`: Output result as a JSON envelope containing answer, session UUID, brain path, metrics, and clarification status (if the clarify tool was invoked).
 - `--brain-dir <path>`: Override the session log base directory (defaults to `./brain`).
 - `--no-cleanup`: Skip automatic deletion of session directories older than 30 days.
 

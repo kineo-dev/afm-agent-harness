@@ -23,6 +23,7 @@ public final class Agent: @unchecked Sendable {
         public var triageDecision: String? = nil
         public var routedToAdvanced: Bool = false
         public var advancedRequestedButUnavailable: Bool = false
+        public var clarificationRequested: Bool = false
     }
 
     public private(set) var metrics = Metrics()
@@ -58,7 +59,13 @@ public final class Agent: @unchecked Sendable {
     7. If the task asks for a conclusion, judgment, or report as its deliverable, write it to a file
        with write_file (or edit_file) rather than only stating it in a plain-text reply.
     8. When reading files, prefer begin_line/end_line for anything that might be large (source code,
-       logs, documents). Do not read_file a whole file speculatively; use grep/find to locate relevant sections first.
+       logs, documents). Do not read_file a whole file speculatively; use search_files or grep to locate relevant sections first.
+    9. When searching for files, text, or symbols across the workspace, prefer search_files over
+       piping find/grep in bash.
+    10. For edit_file and write_file, you may specify dry_run: true to preview diffs before applying.
+    11. If a previous file modification was erroneous, call file_undo to restore the prior state.
+    12. If instructions are ambiguous or critical choices must be made, call clarify with
+        a concrete question and discrete options instead of guessing.
     """
 
     public static let readOnlyNotice = """
@@ -88,12 +95,14 @@ public final class Agent: @unchecked Sendable {
         self.localTier = ModelTier.detectLocalTier()
         self.metrics.localTier = self.localTier.rawValue
 
+        let contextBudget = Executor.detectContextCharBudget()
         let exec = Executor(
             sessionId: sid,
             brainBaseDir: brainDir,
             scopeDir: scopeDir,
             readOnly: readOnly,
-            interactive: interactive
+            interactive: interactive,
+            contextCharBudget: contextBudget
         )
         self.executor = exec
 
@@ -109,9 +118,12 @@ public final class Agent: @unchecked Sendable {
             let readFile = ReadFileTool(executor: exec)
             let writeFile = WriteFileTool(executor: exec)
             let editFile = EditFileTool(executor: exec)
+            let searchFiles = SearchFilesTool(executor: exec)
+            let fileUndo = FileUndoTool(executor: exec)
+            let clarify = ClarifyTool(executor: exec)
 
             self.session = LanguageModelSession(
-                tools: [bash, readFile, writeFile, editFile],
+                tools: [bash, readFile, writeFile, editFile, searchFiles, fileUndo, clarify],
                 instructions: prompt
             )
         }
@@ -185,6 +197,10 @@ public final class Agent: @unchecked Sendable {
             do {
                 let response = try await session.respond(to: currentPrompt, options: responseOptions)
                 let text = response.content
+
+                if executor.clarificationRequested {
+                    metrics.clarificationRequested = true
+                }
 
                 // Check if any error occurred during tool execution within this turn
                 if executor.lastWasError {

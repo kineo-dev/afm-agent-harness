@@ -4,6 +4,9 @@ import Darwin
 #else
 import Glibc
 #endif
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 public final class Executor: @unchecked Sendable {
     public let sessionId: String
@@ -27,7 +30,57 @@ public final class Executor: @unchecked Sendable {
         "/lib/", "/lib64/", "/usr/lib/"
     ]
 
-    public init(sessionId: String? = nil, brainBaseDir: String? = nil, scopeDir: String? = nil, readOnly: Bool = false, interactive: Bool = true) {
+    // MARK: - File Operation History (file_undo)
+
+    public struct FileOperationEntry: Sendable {
+        public let id: String
+        public let path: String
+        public let backupFilename: String?
+        public let hadPreviousContent: Bool
+        public let timestamp: Date
+    }
+
+    public let fileHistoryDir: String
+    private var operationLog: [FileOperationEntry] = []
+
+    // MARK: - Clarification State (clarify)
+
+    public private(set) var clarificationRequested: Bool = false
+    public private(set) var lastClarificationQuestion: String? = nil
+
+    // MARK: - Dynamic Context Size Detection
+    //
+    // NOTE: The exact SystemLanguageModel API used below could not be verified on this Linux host
+    // (FoundationModels is unavailable on Linux) and must be confirmed at Mac build time.
+    // In Osaurus, SystemLanguageModel.contextSize was used on macOS 26.4+ / 27.0+.
+    // On macOS 26.x baseline (4096 tokens), safe full-file read limit is 3,000 characters.
+    // On macOS 27.0+ / coreAdvanced3 (8192 tokens), safe full-file read limit scales to ~7,000 characters.
+    // If the framework/API is unavailable, this safely falls back to the baseline of 3,000 characters.
+    public let contextCharBudget: Int
+
+    public static func detectContextCharBudget() -> Int {
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, *) {
+            #if canImport(Darwin)
+            if #available(macOS 27.0, *) {
+                if SystemLanguageModel.default.variant == SystemLanguageModel.Variant.coreAdvanced3 {
+                    return 7000
+                }
+            }
+            #endif
+        }
+        #endif
+        return maxFullReadFileChars
+    }
+
+    public init(
+        sessionId: String? = nil,
+        brainBaseDir: String? = nil,
+        scopeDir: String? = nil,
+        readOnly: Bool = false,
+        interactive: Bool = true,
+        contextCharBudget: Int? = nil
+    ) {
         self.sessionId = sessionId ?? UUID().uuidString
         let base = brainBaseDir ?? "brain"
         self.brainDir = URL(fileURLWithPath: base).appendingPathComponent(self.sessionId).path
@@ -37,8 +90,12 @@ public final class Executor: @unchecked Sendable {
         self.readOnly = readOnly
         self.interactive = interactive
         self.approval = Approval(scopeDir: self.scopeDir, interactive: interactive)
+        self.contextCharBudget = contextCharBudget ?? Self.detectContextCharBudget()
+
+        self.fileHistoryDir = URL(fileURLWithPath: self.brainDir).appendingPathComponent("file_history").path
 
         ensureDirectoryPermissions(self.brainDir, mode: 0o700)
+        ensureDirectoryPermissions(self.fileHistoryDir, mode: 0o700)
     }
 
     private func ensureDirectoryPermissions(_ path: String, mode: mode_t) {
@@ -331,10 +388,10 @@ public final class Executor: @unchecked Sendable {
         let lines = content.components(separatedBy: "\n")
         let total = lines.count
 
-        // Pre-check: guard against context overflow on 4k models when no line range is specified
-        if beginLine == nil && endLine == nil && content.count > Self.maxFullReadFileChars {
+        // Pre-check: guard against context overflow when no line range is specified
+        if beginLine == nil && endLine == nil && content.count > contextCharBudget {
             lastWasError = true
-            let out = "File too large (\(content.count) chars, \(total) lines) to read in full — retry with begin_line/end_line to read a smaller slice, or use grep to find the relevant section first."
+            let out = "File too large (\(content.count) chars, \(total) lines) to read in full (context limit: \(contextCharBudget) chars) — retry with begin_line/end_line to read a smaller slice, or use search_files to find the relevant section first."
             appendResultLog(toolName: "read_file", label: resolved, output: out)
             return out
         }
@@ -358,13 +415,21 @@ public final class Executor: @unchecked Sendable {
             finalResult = content
         }
 
+        // Universal guard: ensure final output does not exceed context budget regardless of which branch produced it
+        if finalResult.count > contextCharBudget {
+            lastWasError = true
+            let out = "Requested range too large (\(finalResult.count) chars) for context budget (\(contextCharBudget) chars) — request a smaller line range."
+            appendResultLog(toolName: "read_file", label: resolved, output: out)
+            return out
+        }
+
         appendResultLog(toolName: "read_file", label: resolved, output: "[ok: \(finalResult.count) chars]")
         return finalResult
     }
 
     // MARK: - Tool: write_file
 
-    public func writeFile(path: String, content: String) -> String {
+    public func writeFile(path: String, content: String, dryRun: Bool = false) -> String {
         lastWasError = false
         if readOnly {
             lastWasError = true
@@ -381,6 +446,19 @@ public final class Executor: @unchecked Sendable {
             return out
         }
 
+        if dryRun {
+            if FileManager.default.fileExists(atPath: resolved) {
+                let size = (try? FileManager.default.attributesOfItem(atPath: resolved)[.size] as? Int) ?? 0
+                let out = "[DRY RUN] Would overwrite existing file (\(resolved): \(size) bytes -> \(content.count) chars)"
+                appendResultLog(toolName: "write_file", label: resolved, output: out)
+                return out
+            } else {
+                let out = "[DRY RUN] Would create new file with \(content.count) chars at \(resolved)"
+                appendResultLog(toolName: "write_file", label: resolved, output: out)
+                return out
+            }
+        }
+
         let desc = "write to \(resolved) (\(content.count) chars)"
         if !approval.prompt(command: "write_file \(resolved)", description: desc) {
             lastWasError = true
@@ -391,6 +469,18 @@ public final class Executor: @unchecked Sendable {
 
         let parentDir = URL(fileURLWithPath: resolved).deletingLastPathComponent().path
         ensureDirectoryPermissions(parentDir, mode: 0o755)
+
+        // Record history entry before mutation for file_undo
+        let opId = UUID().uuidString
+        var backupName: String? = nil
+        let hadPrior = FileManager.default.fileExists(atPath: resolved)
+        if hadPrior {
+            backupName = "\(opId).bak"
+            let backupDst = URL(fileURLWithPath: fileHistoryDir).appendingPathComponent(backupName!).path
+            try? FileManager.default.copyItem(atPath: resolved, toPath: backupDst)
+            chmod(backupDst, 0o600)
+        }
+        operationLog.append(FileOperationEntry(id: opId, path: resolved, backupFilename: backupName, hadPreviousContent: hadPrior, timestamp: Date()))
 
         // Atomic write via temporary file
         let tempUrl = URL(fileURLWithPath: parentDir).appendingPathComponent(".tmp_\(UUID().uuidString)")
@@ -413,14 +503,14 @@ public final class Executor: @unchecked Sendable {
             return out
         }
 
-        let out = "Successfully wrote \(content.count) chars to \(resolved)"
+        let out = "Successfully wrote \(content.count) chars to \(resolved) [op_id: \(opId)]"
         appendResultLog(toolName: "write_file", label: resolved, output: out)
         return out
     }
 
     // MARK: - Tool: edit_file
 
-    public func editFile(path: String, oldString: String, newString: String) -> String {
+    public func editFile(path: String, oldString: String, newString: String, dryRun: Bool = false) -> String {
         lastWasError = false
         if readOnly {
             lastWasError = true
@@ -441,14 +531,6 @@ public final class Executor: @unchecked Sendable {
             lastWasError = true
             let out = "Edit blocked: \(resolved)"
             appendResultLog(toolName: "edit_file", label: path, output: out)
-            return out
-        }
-
-        let desc = "edit \(resolved): replace '\(oldString.prefix(40))' with '\(newString.prefix(40))'"
-        if !approval.prompt(command: "edit_file \(resolved)", description: desc) {
-            lastWasError = true
-            let out = "Edit denied by user."
-            appendResultLog(toolName: "edit_file", label: resolved, output: out)
             return out
         }
 
@@ -475,6 +557,28 @@ public final class Executor: @unchecked Sendable {
             return out
         }
 
+        if dryRun {
+            let out = "[DRY RUN] Would replace in \(resolved):\n--- old ---\n\(oldString)\n--- new ---\n\(newString)"
+            appendResultLog(toolName: "edit_file", label: resolved, output: out)
+            return out
+        }
+
+        let desc = "edit \(resolved): replace '\(oldString.prefix(40))' with '\(newString.prefix(40))'"
+        if !approval.prompt(command: "edit_file \(resolved)", description: desc) {
+            lastWasError = true
+            let out = "Edit denied by user."
+            appendResultLog(toolName: "edit_file", label: resolved, output: out)
+            return out
+        }
+
+        // Record history entry before mutation for file_undo
+        let opId = UUID().uuidString
+        let backupName = "\(opId).bak"
+        let backupDst = URL(fileURLWithPath: fileHistoryDir).appendingPathComponent(backupName).path
+        try? FileManager.default.copyItem(atPath: resolved, toPath: backupDst)
+        chmod(backupDst, 0o600)
+        operationLog.append(FileOperationEntry(id: opId, path: resolved, backupFilename: backupName, hadPreviousContent: true, timestamp: Date()))
+
         // Backup existing file to .bak
         let backupPath = resolved + ".bak"
         try? FileManager.default.copyItem(atPath: resolved, toPath: backupPath)
@@ -495,8 +599,263 @@ public final class Executor: @unchecked Sendable {
             return out
         }
 
-        let out = "Successfully edited \(resolved) (backup kept at \(backupPath))"
+        let out = "Successfully edited \(resolved) [op_id: \(opId)] (backup kept at \(backupPath))"
         appendResultLog(toolName: "edit_file", label: resolved, output: out)
         return out
+    }
+
+    // MARK: - Tool: file_undo
+
+    public func undoFile(operationId: String? = nil, path: String? = nil) -> String {
+        lastWasError = false
+        if readOnly {
+            lastWasError = true
+            let out = "file_undo blocked: agent is running in --read-only mode."
+            appendResultLog(toolName: "file_undo", label: "all", output: out)
+            return out
+        }
+
+        guard !operationLog.isEmpty else {
+            lastWasError = true
+            let out = "Undo failed: no file operations recorded in this session."
+            appendResultLog(toolName: "file_undo", label: "none", output: out)
+            return out
+        }
+
+        let targetIndex: Int?
+        if let opId = operationId, !opId.isEmpty {
+            targetIndex = operationLog.lastIndex(where: { $0.id == opId })
+        } else if let p = path, !p.isEmpty {
+            let (_, resolved) = validatePath(p)
+            targetIndex = operationLog.lastIndex(where: { $0.path == resolved })
+        } else {
+            targetIndex = operationLog.indices.last
+        }
+
+        guard let idx = targetIndex else {
+            lastWasError = true
+            let out = "Undo failed: no matching operation found in history."
+            appendResultLog(toolName: "file_undo", label: operationId ?? path ?? "latest", output: out)
+            return out
+        }
+
+        let entry = operationLog.remove(at: idx)
+        let desc = "undo operation \(entry.id) on \(entry.path)"
+        if !approval.prompt(command: "write_file \(entry.path)", description: desc) {
+            lastWasError = true
+            operationLog.insert(entry, at: idx)
+            let out = "Undo denied by user."
+            appendResultLog(toolName: "file_undo", label: entry.path, output: out)
+            return out
+        }
+
+        if entry.hadPreviousContent, let bName = entry.backupFilename {
+            let bPath = URL(fileURLWithPath: fileHistoryDir).appendingPathComponent(bName).path
+            do {
+                if FileManager.default.fileExists(atPath: entry.path) {
+                    try FileManager.default.removeItem(atPath: entry.path)
+                }
+                try FileManager.default.copyItem(atPath: bPath, toPath: entry.path)
+                let out = "Successfully reverted operation \(entry.id) on \(entry.path) (restored previous content from backup)"
+                appendResultLog(toolName: "file_undo", label: entry.path, output: out)
+                return out
+            } catch {
+                lastWasError = true
+                let out = "Undo error restoring \(entry.path): \(error.localizedDescription)"
+                appendResultLog(toolName: "file_undo", label: entry.path, output: out)
+                return out
+            }
+        } else {
+            // File was newly created, so undoing means removing it
+            do {
+                if FileManager.default.fileExists(atPath: entry.path) {
+                    try FileManager.default.removeItem(atPath: entry.path)
+                }
+                let out = "Successfully reverted operation \(entry.id) on \(entry.path) (removed newly created file)"
+                appendResultLog(toolName: "file_undo", label: entry.path, output: out)
+                return out
+            } catch {
+                lastWasError = true
+                let out = "Undo error removing \(entry.path): \(error.localizedDescription)"
+                appendResultLog(toolName: "file_undo", label: entry.path, output: out)
+                return out
+            }
+        }
+    }
+
+    // MARK: - Tool: search_files
+
+    public func searchFiles(pattern: String, path: String? = nil, glob: String? = nil) -> String {
+        lastWasError = false
+        if pattern.isEmpty {
+            lastWasError = true
+            let out = "Search failed: pattern cannot be empty."
+            appendResultLog(toolName: "search_files", label: "empty", output: out)
+            return out
+        }
+
+        let targetDir = path ?? (scopeDir ?? FileManager.default.currentDirectoryPath)
+        let (valid, resolved) = validatePath(targetDir)
+        if !valid {
+            lastWasError = true
+            let out = "Search blocked: \(resolved)"
+            appendResultLog(toolName: "search_files", label: targetDir, output: out)
+            return out
+        }
+
+        let desc = "search in \(resolved) for '\(pattern)'"
+        if !approval.prompt(command: "read_file \(resolved)", description: desc, alwaysAllowKey: "search_files \(resolved)") {
+            lastWasError = true
+            let out = "Search denied by user."
+            appendResultLog(toolName: "search_files", label: resolved, output: out)
+            return out
+        }
+
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved, isDirectory: &isDir) else {
+            lastWasError = true
+            let out = "Search failed: \(resolved) does not exist."
+            appendResultLog(toolName: "search_files", label: resolved, output: out)
+            return out
+        }
+
+        let maxScannedFiles = 2000
+        let maxMatches = 200
+        var scannedCount = 0
+        var matchCount = 0
+        var matchedFilesCount = 0
+        var results: [String] = []
+
+        let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+
+        func matchesGlob(_ filename: String, globPattern: String?) -> Bool {
+            guard let gp = globPattern, !gp.isEmpty else { return true }
+            return fnmatch(gp, filename, 0) == 0
+        }
+
+        func searchSingleFile(_ filePath: String) {
+            guard scannedCount < maxScannedFiles && matchCount < maxMatches else { return }
+            scannedCount += 1
+
+            for prefix in Self.blockedPathPrefixes {
+                if filePath.hasPrefix(prefix) { return }
+            }
+
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)),
+                  data.count <= Self.maxReadFileBytes,
+                  let text = String(data: data, encoding: .utf8) else {
+                return
+            }
+
+            let lines = text.components(separatedBy: "\n")
+            var fileHadMatch = false
+
+            for (idx, line) in lines.enumerated() {
+                if matchCount >= maxMatches { break }
+                let lineNum = idx + 1
+                var isMatch = false
+                if let re = regex {
+                    let range = NSRange(location: 0, length: line.utf16.count)
+                    isMatch = re.firstMatch(in: line, options: [], range: range) != nil
+                } else {
+                    isMatch = line.localizedCaseInsensitiveContains(pattern)
+                }
+
+                if isMatch {
+                    let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let relPath = filePath.hasPrefix(resolved) ? String(filePath.dropFirst(resolved.hasSuffix("/") ? resolved.count : resolved.count + 1)) : filePath
+                    results.append("\(relPath):\(lineNum): \(trimmedLine.prefix(200))")
+                    matchCount += 1
+                    fileHadMatch = true
+                }
+            }
+
+            if fileHadMatch {
+                matchedFilesCount += 1
+            }
+        }
+
+        if !isDir.boolValue {
+            searchSingleFile(resolved)
+        } else {
+            let enumerator = FileManager.default.enumerator(
+                at: URL(fileURLWithPath: resolved),
+                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+                options: [.skipsPackageDescendants]
+            )
+
+            while let fileURL = enumerator?.nextObject() as? URL {
+                if scannedCount >= maxScannedFiles || matchCount >= maxMatches {
+                    break
+                }
+                let pathString = fileURL.path
+                let filename = fileURL.lastPathComponent
+
+                if filename == ".git" || filename == ".build" || filename == "DerivedData" || filename == "brain" {
+                    enumerator?.skipDescendants()
+                    continue
+                }
+
+                guard matchesGlob(filename, globPattern: glob) else {
+                    continue
+                }
+
+                var isReg: ObjCBool = false
+                if FileManager.default.fileExists(atPath: pathString, isDirectory: &isReg), !isReg.boolValue {
+                    searchSingleFile(pathString)
+                }
+            }
+        }
+
+        var header = "[search: \(matchCount) match(es) across \(matchedFilesCount) file(s), scanned \(scannedCount) files]"
+        if matchCount >= maxMatches {
+            header += " [hit limit of \(maxMatches) matches]"
+        }
+        if results.isEmpty {
+            let out = "No matches found for '\(pattern)' in \(resolved)."
+            appendResultLog(toolName: "search_files", label: resolved, output: out)
+            return out
+        } else {
+            let out = header + "\n" + results.joined(separator: "\n")
+            appendResultLog(toolName: "search_files", label: resolved, output: "[ok: \(matchCount) matches]")
+            return out
+        }
+    }
+
+    // MARK: - Tool: clarify
+
+    public func clarify(question: String, options: [String]? = nil, allowMultiple: Bool? = nil) -> String {
+        clarificationRequested = true
+        lastClarificationQuestion = question
+
+        if interactive {
+            var promptStr = "\n❓ Clarification requested by agent:\n\(question)\n"
+            if let opts = options, !opts.isEmpty {
+                for (idx, opt) in opts.enumerated() {
+                    promptStr += "  [\(idx + 1)] \(opt)\n"
+                }
+                promptStr += "Enter choice (1-\(opts.count) or custom text): "
+            } else {
+                promptStr += "Your answer: "
+            }
+            FileHandle.standardError.write(Data(promptStr.utf8))
+
+            if let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
+                if let opts = options, let num = Int(line), num >= 1 && num <= opts.count {
+                    let chosen = opts[num - 1]
+                    appendResultLog(toolName: "clarify", label: question, output: "User selected: \(chosen)")
+                    return "User selected: \(chosen)"
+                }
+                appendResultLog(toolName: "clarify", label: question, output: "User replied: \(line)")
+                return "User answer: \(line)"
+            }
+            let defaultReply = "No answer provided by user. Proceed with best judgment."
+            appendResultLog(toolName: "clarify", label: question, output: defaultReply)
+            return defaultReply
+        } else {
+            let out = "No interactive user available. Proceeding with best judgment; state your assumption explicitly in the final answer."
+            appendResultLog(toolName: "clarify", label: question, output: out)
+            return out
+        }
     }
 }
