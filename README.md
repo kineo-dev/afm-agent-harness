@@ -62,8 +62,6 @@ lower temperature and a larger token budget (`Agent.advancedGenerationOptions`).
 host (e.g. an M1 Mac), an `advanced` triage verdict is logged (`metrics.advanced_requested_but_unavailable`)
 and the request is still handled locally at baseline effort — there is no cross-host fallback.
 
-Verification across hardware tiers is recorded in local development notes (not included in this repository).
-
 ---
 
 ## Project Structure

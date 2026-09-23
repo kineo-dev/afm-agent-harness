@@ -37,10 +37,6 @@ test_output/
 *.profdata
 *.profraw
 
-# Development record (dated history/rationale, not tracked in git)
-KNOWN_ISSUES.md
-docs/OSAURUS_ADOPTIONS.md
-
 # Environment & Local Secrets
 .env
 .env.*

@@ -50,8 +50,8 @@ public final class Executor: @unchecked Sendable {
 
     // MARK: - Dynamic Context Size Detection
     //
-    // NOTE: The exact SystemLanguageModel API used below could not be verified on this Linux host
-    // (FoundationModels is unavailable on Linux) and must be confirmed at Mac build time.
+    // NOTE: FoundationModels is only available on Apple platforms; the API usage below is guarded
+    // by canImport/availability checks and falls back to the baseline budget elsewhere.
     // In Osaurus, SystemLanguageModel.contextSize was used on macOS 26.4+ / 27.0+.
     // On macOS 26.x baseline (4096 tokens), safe full-file read limit is 3,000 characters.
     // On macOS 27.0+ / coreAdvanced3 (8192 tokens), safe full-file read limit scales to ~7,000 characters.
