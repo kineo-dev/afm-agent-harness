@@ -176,13 +176,18 @@ public final class Approval: @unchecked Sendable {
 
         // Must match a safe prefix
         let isSafePrefix = Self.safePrefixes.contains { prefix in
-            if stripped == prefix.trimmingCharacters(in: .whitespaces) {
-                return true
+            if prefix.hasSuffix(" ") {
+                return stripped.hasPrefix(prefix)
+            } else {
+                if stripped == prefix {
+                    return true
+                }
+                if stripped.hasPrefix(prefix) {
+                    let nextIndex = stripped.index(stripped.startIndex, offsetBy: prefix.count)
+                    return stripped[nextIndex].isWhitespace
+                }
+                return false
             }
-            if stripped.hasPrefix(prefix) {
-                return true
-            }
-            return false
         }
         if !isSafePrefix { return false }
 
@@ -227,7 +232,7 @@ public final class Approval: @unchecked Sendable {
         // Guard rg against mutating or unsafe flags
         if stripped.hasPrefix("rg ") || stripped == "rg" {
             let tokens = stripped.split(separator: " ").map(String.init)
-            let unsafeRg = ["--replace", "-r", "--passthru"]
+            let unsafeRg = ["--replace", "-r", "--passthru", "--pre", "--search-zip"]
             if tokens.contains(where: { unsafeRg.contains($0) }) {
                 return false
             }

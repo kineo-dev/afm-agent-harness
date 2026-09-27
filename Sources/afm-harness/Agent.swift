@@ -74,6 +74,7 @@ public final class Agent: @unchecked Sendable {
     plain read-only command (ls/cat/grep/git status/etc.) will be blocked before execution.
     This is enforced mechanically, not just by instruction — do not attempt writes, edits, package
     installs, or state-changing commands; they will be rejected automatically.
+    Rule 7 (write your conclusion to a file) does not apply in this mode since write_file and edit_file are not available in read-only sessions; state your conclusion directly in your final reply instead.
     """
 
     public init(
@@ -116,14 +117,18 @@ public final class Agent: @unchecked Sendable {
         } else {
             let bash = BashTool(executor: exec)
             let readFile = ReadFileTool(executor: exec)
-            let writeFile = WriteFileTool(executor: exec)
-            let editFile = EditFileTool(executor: exec)
             let searchFiles = SearchFilesTool(executor: exec)
-            let fileUndo = FileUndoTool(executor: exec)
             let clarify = ClarifyTool(executor: exec)
 
+            var tools: [any Tool] = [bash, readFile, searchFiles, clarify]
+            if !readOnly {
+                tools.append(WriteFileTool(executor: exec))
+                tools.append(EditFileTool(executor: exec))
+                tools.append(FileUndoTool(executor: exec))
+            }
+
             self.session = LanguageModelSession(
-                tools: [bash, readFile, writeFile, editFile, searchFiles, fileUndo, clarify],
+                tools: tools,
                 instructions: prompt
             )
         }
@@ -211,7 +216,6 @@ public final class Agent: @unchecked Sendable {
                             attempted: "Session turn with prompt: \(currentPrompt.prefix(100))",
                             error: "A tool execution returned an error condition during this step."
                         )
-                        return "Error: Tool execution failed in non-interactive mode. Escalation report written to brain dir."
                     }
                 }
 

@@ -122,9 +122,10 @@ swift build -c release
 ```
 
 ### CLI Options
-- `-p`, `--prompt <text>`: Single-shot prompt mode (non-interactive, stops on first tool error).
+- `-p`, `--prompt <text>`: Single-shot prompt mode (non-interactive); if a tool call errors, the model's answer is still returned and an escalation report is logged to brain dir.
 - `--scope <path>`: Restrict filesystem access and default working directory to `<path>`.
 - `--read-only`: Mechanically block `write_file`, `edit_file`, and any non-read-only bash commands.
+  - `write_file`, `edit_file`, and `file_undo` are not registered as tools in this mode, not just blocked at execution time.
 - `--no-tools`: Run in pure reasoning mode without registering tools to avoid reflexive tool calling.
 - `--json`: Output result as a JSON envelope containing answer, session UUID, brain path, metrics, and clarification status (if the clarify tool was invoked).
 - `--brain-dir <path>`: Override the session log base directory (defaults to `./brain`).
