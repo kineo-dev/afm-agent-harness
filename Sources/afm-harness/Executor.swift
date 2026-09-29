@@ -52,22 +52,18 @@ public final class Executor: @unchecked Sendable {
     //
     // NOTE: FoundationModels is only available on Apple platforms; the API usage below is guarded
     // by canImport/availability checks and falls back to the baseline budget elsewhere.
-    // In Osaurus, SystemLanguageModel.contextSize was used on macOS 26.4+ / 27.0+.
-    // On macOS 26.x baseline (4096 tokens), safe full-file read limit is 3,000 characters.
-    // On macOS 27.0+ / coreAdvanced3 (8192 tokens), safe full-file read limit scales to ~7,000 characters.
+    // SystemLanguageModel.contextSize is available from macOS 26.0 via back-deploy.
+    // On 4096 tokens baseline, safe full-file read limit is 3,000 characters.
+    // Larger context sizes scale to ~7,000 characters.
     // If the framework/API is unavailable, this safely falls back to the baseline of 3,000 characters.
     public let contextCharBudget: Int
 
     public static func detectContextCharBudget() -> Int {
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
-            #if canImport(Darwin)
-            if #available(macOS 27.0, *) {
-                if SystemLanguageModel.default.variant == SystemLanguageModel.Variant.coreAdvanced3 {
-                    return 7000
-                }
+            if SystemLanguageModel.default.contextSize > 4096 {
+                return 7000
             }
-            #endif
         }
         #endif
         return maxFullReadFileChars

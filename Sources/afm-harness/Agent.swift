@@ -34,7 +34,7 @@ public final class Agent: @unchecked Sendable {
     public static let forceSynthesisAt = 20
 
     // Only meaningfully different from the default on hosts where localTier == .advanced,
-    // since that's the only case where the underlying model is actually the bigger variant.
+    // since that's the only case where the underlying model is actually the bigger tier.
     public static let advancedGenerationOptions = GenerationOptions(temperature: 0.2, maximumResponseTokens: 4096)
 
     public static let systemPromptTemplate = """

@@ -4,21 +4,20 @@ import FoundationModels
 // MARK: - Model Tier
 
 /// Which on-device Foundation Models capability tier this host actually has.
-/// `SystemLanguageModel.default` resolves to whichever variant the OS decides is
-/// appropriate for the current hardware — there is no public API to explicitly request
-/// a specific variant, and there is no cross-host dispatch. This type exists purely to
-/// observe that resolved choice so the agent can react to it locally.
+/// The tier is inferred from the context window size (baseline 4096 tokens,
+/// larger means advanced). This type exists purely to observe that capability
+/// so the agent can react to it locally.
 public enum ModelTier: String, Codable, Sendable, Equatable {
     case baseline
     case advanced
 
-    @available(macOS 27.0, *)
+    @available(macOS 26.0, *)
     private static func detectLocal() -> ModelTier {
-        SystemLanguageModel.default.variant == SystemLanguageModel.Variant.coreAdvanced3 ? .advanced : .baseline
+        SystemLanguageModel.default.contextSize > 4096 ? .advanced : .baseline
     }
 
     public static func detectLocalTier() -> ModelTier {
-        if #available(macOS 27.0, *) {
+        if #available(macOS 26.0, *) {
             return detectLocal()
         }
         return .baseline

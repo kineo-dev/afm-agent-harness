@@ -48,9 +48,9 @@ On Apple Silicon (M1, 16GB, macOS 27.0):
 
 ## Model Tier Detection & Triage
 
-`SystemLanguageModel.default` resolves to whichever `Variant` (`core3` baseline or `coreAdvanced3`
-advanced) the OS decides is appropriate for the current Mac's hardware — there is no public API to
-explicitly request a specific variant, and this harness never dispatches work to another machine.
+`SystemLanguageModel.default` resolves to whichever capability tier (baseline 4096-token
+context window or larger advanced window) the OS decides is appropriate for the current Mac's
+hardware, and this harness never dispatches work to another machine.
 On startup, `Agent` calls `ModelTier.detectLocalTier()` once to record which tier the local host
 actually has (visible in the interactive banner and in `metrics.local_tier`).
 
