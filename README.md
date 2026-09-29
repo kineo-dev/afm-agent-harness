@@ -9,9 +9,12 @@ This project serves as the lightweight local "hands and feet" worker agent for h
 ## Important System Requirements & Constraints
 
 > [!IMPORTANT]
-> **macOS & Apple Silicon Only**: This project can **ONLY** be compiled and executed on an Apple Silicon Mac running macOS 15+ (Sequoia / macOS 26+) with Apple Intelligence / FoundationModels framework support.
+> **macOS & Apple Silicon Only**: This project can **ONLY** be compiled and executed on an Apple Silicon Mac running macOS 26 (Tahoe) or later with Apple Intelligence / FoundationModels framework support.
 >
 > Development and Git tracking can be hosted on a central development machine or server, while compilation and runtime testing must be performed directly on an Apple Silicon Mac.
+
+> [!NOTE]
+> Apple Intelligence must be enabled on the Mac (System Settings, Apple Intelligence and Siri); otherwise runs fail with the error Apple Intelligence is not enabled.
 
 ---
 
@@ -117,6 +120,9 @@ Passing `dry_run: true` to `write_file` or `edit_file` previews the change witho
 ## Command-Line Usage
 
 ### Building on macOS
+
+The package builds against the macOS 26.x SDK as well as the macOS 27 SDK; model tier detection uses SystemLanguageModel.contextSize, which is available from macOS 26.0.
+
 ```bash
 swift build -c release
 ```
