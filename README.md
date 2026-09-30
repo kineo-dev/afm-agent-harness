@@ -37,7 +37,7 @@ While `afm-agent-harness` mirrors the proven security and operational separation
 
 On Apple Silicon (M1, 16GB, macOS 27.0):
 
-- **Tool Calling / Function Calling**: Executed reliably via the `Tool` protocol with sub-2s latency and zero hallucination for required inspection tools.
+- **Tool Calling / Function Calling**: Executed via the `Tool` protocol. The 3B on-device model works best on small, single-step tasks (read one file, find one symbol, list a directory); multi-step tasks can loop or answer from incomplete evidence, so always check the answer against the tool output recorded in the brain directory.
 - **Structured Output (`Generable`)**: Schema-guided generation provides 100% typed integrity without JSON parsing exceptions.
 - **Multi-turn Context Retention**: Successfully preserved multi-step context across multi-turn reasoning and tool-execution turns.
 - **Safe Boundary Awareness**: Reliably declined real-time dynamic queries (e.g. current live weather) instead of hallucinating answers.
@@ -45,7 +45,7 @@ On Apple Silicon (M1, 16GB, macOS 27.0):
   - *Single-function refactoring*: Accurately performed targeted refactorings (e.g. replacing `str.split()` with `shlex.split()` and adding imports) without touching unrelated code.
   - *Complex multi-part edits*: Struggles with compound instructions requiring logic removal/relaxation (e.g. removing `html.escape` across multiple call sites while retaining table-cell pipe escaping); the model demonstrates a strong bias toward preserving existing safety/robustness logic against explicit removal instructions.
 - **Reflexive Tool-Calling**: When tools are registered in a session, the model reflexively invokes tools (like `read_file`) upon encountering file paths in prompt text, even under explicit negative instructions ("Do not use tools"). The `--no-tools` mode exists as an architectural separation to enable pure code-reasoning without tool interference.
-- **Context Window Budget**: The safe full-file read limit scales with the detected on-device model tier -- approximately 3,000 characters on baseline hardware (~4096-token window) and up to ~7,000 characters on advanced-tier hardware. Reads exceeding the active budget, whether requested in full or via begin_line/end_line, are rejected with guidance to narrow the range or use search_files. Tool output across bash, read_file, and search_files is additionally capped by a cumulative per-turn budget, and on context overflow the session is reset and an actionable message is returned. Identical tool calls repeated three times, or more than 15 tool calls in one turn, abort the turn with an explanatory message.
+- **Context Window Budget**: The safe full-file read limit scales with the detected on-device model tier -- approximately 3,000 characters on baseline hardware (~4096-token window) and up to ~7,000 characters on advanced-tier hardware. Reads exceeding the active budget, whether requested in full or via begin_line/end_line, are rejected with guidance to narrow the range or use search_files. Tool output across bash, read_file, search_files, and list_files is additionally capped by a cumulative per-turn budget, and on context overflow the session is reset and an actionable message is returned. Identical tool calls repeated three times, or more than 15 tool calls in one turn, abort the turn with an explanatory message.
 
 ---
 
@@ -77,7 +77,7 @@ afm-agent-harness/
     └── afm-harness/
         ├── main.swift          # CLI argument parser, cleanup routines, execution runner
         ├── Agent.swift         # LanguageModelSession orchestrator, tool loop, forced synthesis
-        ├── Executor.swift      # Sandboxed bash/read/write/edit implementations & brain logging
+        ├── Executor.swift      # Sandboxed bash/read/write/edit/search/list implementations & brain logging
         ├── Approval.swift      # SAFE_PREFIXES auto-approval, shell operator inspection, scope gates
         ├── Tools.swift         # FoundationModels Tool protocol definitions for all built-in tools
         └── Triage.swift        # ModelTier detection and baseline/advanced triage classifier
@@ -96,6 +96,8 @@ afm-agent-harness/
 5. **Atomic Writes**: File writes and edits write to temporary files before atomically replacing target files, accompanied by `.bak` backup retention.
 6. **Execution Limits**: Subprocess execution defaults to a 60-second timeout, kills process groups with `SIGKILL` on timeout, and truncates outputs exceeding 5MB.
 7. **Brain Session Directory**: Logs and failure escalation reports are saved to `brain/<session-uuid>/` with restricted permissions (`0700` directory, `0600` files).
+8. **Concurrent Tool Calls**: The model may call several tools at once. Shared state (the result log, undo history, error flags, the always-allow list) is lock-protected so audit logs stay complete, and interactive approval and clarification prompts are serialized so an answer always refers to the prompt shown.
+9. **Runaway-Loop Guard**: A turn is aborted when the same tool call repeats three times or more than 15 tool calls are made, and the session is reset instead of being left in a half-finished state. File changes already applied are not rolled back; the `file_undo` history is kept across the reset.
 
 ---
 
@@ -135,6 +137,8 @@ swift build -c release
   - `write_file`, `edit_file`, and `file_undo` are not registered as tools in this mode, not just blocked at execution time.
 - `--no-tools`: Run in pure reasoning mode without registering tools to avoid reflexive tool calling.
 - `--json`: Output result as a JSON envelope containing answer, session UUID, brain path, metrics, and clarification status (if the clarify tool was invoked).
+  - `ok` is `false` (and the process exits with code 1) when the run ended with an error: a tool error, an aborted loop, or a context overflow. A successful run exits with code 0.
+  - An aborted loop returns an `answer` starting with `Stopped:`, and a context overflow returns one starting with `Context window exceeded`. In both cases the session was reset and nothing was replayed; retry with a narrower, more specific request.
 - `--brain-dir <path>`: Override the session log base directory (defaults to `./brain`).
 - `--no-cleanup`: Skip automatic deletion of session directories older than 30 days.
 
