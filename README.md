@@ -110,6 +110,7 @@ afm-harness registers the following tools with the LanguageModelSession:
 | `write_file` | Atomically create or overwrite a file | `path`, `content`, `dry_run` |
 | `edit_file` | Replace a unique string in a file, atomically with backup | `path`, `old_string`, `new_string`, `dry_run` |
 | `search_files` | Search inside file contents by regex or substring (does not match file names), with an optional filename glob, without spawning a shell | `pattern`, `path`, `glob` |
+| `list_files` | List files and folders in a directory (shallow by default, optional recursion and glob), without spawning a shell | `path`, `glob`, `recursive` |
 | `file_undo` | Revert a write_file or edit_file operation from earlier in the session | `operation_id`, `path` |
 | `clarify` | Ask the user a clarifying question, optionally with discrete choices, when instructions are ambiguous | `question`, `options`, `allow_multiple` |
 

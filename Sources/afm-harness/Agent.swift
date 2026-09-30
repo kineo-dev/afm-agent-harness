@@ -61,7 +61,7 @@ public final class Agent: @unchecked Sendable {
        with write_file (or edit_file) rather than only stating it in a plain-text reply.
     8. When reading files, prefer begin_line/end_line for anything that might be large (source code,
        logs, documents). Do not read_file a whole file speculatively; use search_files or grep to locate relevant sections first.
-    9. To find TEXT inside files, use search_files (it searches file contents only, never file names). To read a file whose path you know, use read_file directly. To list files, use bash with ls or find.
+    9. To find TEXT inside files, use search_files (it searches file contents only, never file names). To read a file whose path you know, use read_file directly. To see which files exist in a directory, use list_files.
     10. For edit_file and write_file, you may specify dry_run: true to preview diffs before applying.
     11. If a previous file modification was erroneous, call file_undo to restore the prior state.
     12. If instructions are ambiguous or critical choices must be made, call clarify with
@@ -123,9 +123,10 @@ public final class Agent: @unchecked Sendable {
             let bash = BashTool(executor: executor)
             let readFile = ReadFileTool(executor: executor)
             let searchFiles = SearchFilesTool(executor: executor)
+            let listFiles = ListFilesTool(executor: executor)
             let clarify = ClarifyTool(executor: executor)
 
-            var tools: [any Tool] = [bash, readFile, searchFiles, clarify]
+            var tools: [any Tool] = [bash, readFile, searchFiles, listFiles, clarify]
             if !readOnly {
                 tools.append(WriteFileTool(executor: executor))
                 tools.append(EditFileTool(executor: executor))

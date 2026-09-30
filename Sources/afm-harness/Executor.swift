@@ -956,7 +956,7 @@ public final class Executor: @unchecked Sendable {
                 let hits = nameMatches.prefix(3).joined(separator: ", ")
                 out += " A file with that name exists: \(hits) - open it with read_file."
             } else {
-                out += " To list files use bash ls or find."
+                out += " To list files use list_files."
             }
             appendResultLog(toolName: "search_files", label: resolved, output: out)
             return out
@@ -965,6 +965,119 @@ public final class Executor: @unchecked Sendable {
             appendResultLog(toolName: "search_files", label: resolved, output: "[ok: \(matchCount) matches]")
             return budgeted(out)
         }
+    }
+
+    // MARK: - Tool: list_files
+
+    public func listFiles(path: String? = nil, glob: String? = nil, recursive: Bool? = nil) -> String {
+        lastWasError = false
+
+        let target = path ?? (scopeDir ?? FileManager.default.currentDirectoryPath)
+        let (valid, resolved) = validatePath(target)
+        if !valid {
+            lastWasError = true
+            let out = "List blocked: \(resolved)"
+            appendResultLog(toolName: "list_files", label: target, output: out)
+            return out
+        }
+
+        let desc = "list files in \(resolved)"
+        if !approval.prompt(command: "read_file \(resolved)", description: desc, alwaysAllowKey: "list_files \(resolved)") {
+            lastWasError = true
+            let out = "List denied by user."
+            appendResultLog(toolName: "list_files", label: resolved, output: out)
+            return out
+        }
+
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved, isDirectory: &isDir) else {
+            lastWasError = true
+            let out = "List failed: \(resolved) does not exist."
+            appendResultLog(toolName: "list_files", label: resolved, output: out)
+            return out
+        }
+
+        if !isDir.boolValue {
+            let name = URL(fileURLWithPath: resolved).lastPathComponent
+            appendResultLog(toolName: "list_files", label: resolved, output: "[ok: 1 entries]")
+            return budgeted(name)
+        }
+
+        func matchesGlob(_ filename: String, globPattern: String?) -> Bool {
+            guard let gp = globPattern, !gp.isEmpty else { return true }
+            return fnmatch(gp, filename, 0) == 0
+        }
+
+        func isIgnored(_ filename: String) -> Bool {
+            return filename == ".git" || filename == ".build" || filename == "DerivedData" || filename == "brain"
+        }
+
+        var entries: [String] = []
+
+        if recursive != true {
+            let items = (try? FileManager.default.contentsOfDirectory(atPath: resolved)) ?? []
+            for item in items {
+                if isIgnored(item) { continue }
+                guard matchesGlob(item, globPattern: glob) else { continue }
+                let fullPath = URL(fileURLWithPath: resolved).appendingPathComponent(item).path
+                var isSubDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: fullPath, isDirectory: &isSubDir) {
+                    entries.append(isSubDir.boolValue ? "\(item)/" : item)
+                }
+            }
+        } else {
+            let enumerator = FileManager.default.enumerator(
+                at: URL(fileURLWithPath: resolved),
+                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+                options: [.skipsPackageDescendants]
+            )
+            let resolvedPrefix = resolved.hasSuffix("/") ? resolved : resolved + "/"
+            while let fileURL = enumerator?.nextObject() as? URL {
+                let filename = fileURL.lastPathComponent
+                if isIgnored(filename) {
+                    enumerator?.skipDescendants()
+                    continue
+                }
+                let level = enumerator?.level ?? 1
+                if level > 3 {
+                    enumerator?.skipDescendants()
+                    continue
+                }
+                var isSubDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isSubDir) else {
+                    continue
+                }
+                if isSubDir.boolValue && level >= 3 {
+                    enumerator?.skipDescendants()
+                }
+                guard matchesGlob(filename, globPattern: glob) else {
+                    continue
+                }
+                let relPath = fileURL.path.hasPrefix(resolvedPrefix) ? String(fileURL.path.dropFirst(resolvedPrefix.count)) : filename
+                entries.append(isSubDir.boolValue ? (relPath.hasSuffix("/") ? relPath : relPath + "/") : relPath)
+            }
+        }
+
+        if entries.isEmpty {
+            let out = "No entries found in \(resolved)."
+            appendResultLog(toolName: "list_files", label: resolved, output: "[ok: 0 entries]")
+            return budgeted(out)
+        }
+
+        entries.sort { $0.localizedStandardCompare($1) == .orderedAscending }
+        let count = entries.count
+        let entryWord = count == 1 ? "entry" : "entries"
+        var lines: [String] = ["[list: \(count) \(entryWord) in \(resolved)]"]
+        if count > 200 {
+            lines.append(contentsOf: entries.prefix(200))
+            lines.append("[truncated: \(count - 200) more entries; narrow with glob or a subdirectory path]")
+        } else {
+            lines.append(contentsOf: entries)
+        }
+
+        let out = lines.joined(separator: "\n")
+        appendResultLog(toolName: "list_files", label: resolved, output: "[ok: \(count) entries]")
+        return budgeted(out)
     }
 
     // MARK: - Tool: clarify

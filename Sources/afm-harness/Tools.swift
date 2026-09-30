@@ -431,7 +431,7 @@ public struct SearchFilesTool: Tool, Sendable {
     public typealias Output = String
 
     public let name: String = "search_files"
-    public let description: String = "Search INSIDE file contents for a text or regex (does not match file names). To open a known file path use read_file; to list files use bash ls or find."
+    public let description: String = "Search INSIDE file contents for a text or regex (does not match file names). To open a known file path use read_file; to list files use list_files."
     public var parameters: GenerationSchema { Arguments.generationSchema }
     public let executor: Executor
 
@@ -442,6 +442,80 @@ public struct SearchFilesTool: Tool, Sendable {
     public func call(arguments: Arguments) async throws -> String {
         try executor.registerToolCall(name: "search_files", key: "\(arguments.pattern)|\(arguments.path ?? "")|\(arguments.glob ?? "")")
         return executor.searchFiles(pattern: arguments.pattern, path: arguments.path, glob: arguments.glob)
+    }
+}
+
+// MARK: - ListFilesTool
+
+public struct ListFilesTool: Tool, Sendable {
+    public struct Arguments: Generable, Codable, Sendable {
+        /// Optional directory or file path to list (defaults to workspace scope)
+        public let path: String?
+        /// Optional filename glob pattern filter (e.g. *.swift, *.md)
+        public let glob: String?
+        /// Optional boolean: if true, recursively list contents up to 3 levels deep
+        public let recursive: Bool?
+
+        public static var generationSchema: GenerationSchema {
+            GenerationSchema(
+                type: Arguments.self,
+                description: "Arguments for listing files and folders in a directory",
+                properties: [
+                    GenerationSchema.Property(name: "path", description: "Optional directory or file path to list (defaults to workspace scope)", type: String?.self),
+                    GenerationSchema.Property(name: "glob", description: "Optional filename pattern filter (e.g. *.swift, *.md)", type: String?.self),
+                    GenerationSchema.Property(name: "recursive", description: "Optional boolean: if true, list files recursively up to 3 levels", type: Bool?.self)
+                ]
+            )
+        }
+
+        public init(path: String? = nil, glob: String? = nil, recursive: Bool? = nil) {
+            self.path = path
+            self.glob = glob
+            self.recursive = recursive
+        }
+
+        public init(_ content: GeneratedContent) throws {
+            guard case .structure(let props, _) = content.kind else {
+                throw NSError(domain: "ListFilesTool.Arguments", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected structure"])
+            }
+            self.path = props.string(for: "path")
+            self.glob = props.string(for: "glob")
+            self.recursive = props.bool(for: "recursive")
+        }
+
+        public var generatedContent: GeneratedContent {
+            var props: [String: GeneratedContent] = [:]
+            var keys: [String] = []
+            if let p = path {
+                props["path"] = GeneratedContent(kind: .string(p))
+                keys.append("path")
+            }
+            if let g = glob {
+                props["glob"] = GeneratedContent(kind: .string(g))
+                keys.append("glob")
+            }
+            if let r = recursive {
+                props["recursive"] = GeneratedContent(kind: .bool(r))
+                keys.append("recursive")
+            }
+            return GeneratedContent(kind: .structure(properties: props, orderedKeys: keys))
+        }
+    }
+
+    public typealias Output = String
+
+    public let name: String = "list_files"
+    public let description: String = "List the files and folders in a directory (one level by default). Use this instead of search_files when asked which files exist."
+    public var parameters: GenerationSchema { Arguments.generationSchema }
+    public let executor: Executor
+
+    public init(executor: Executor) {
+        self.executor = executor
+    }
+
+    public func call(arguments: Arguments) async throws -> String {
+        try executor.registerToolCall(name: "list_files", key: "\(arguments.path ?? "")|\(arguments.glob ?? "")|\(arguments.recursive ?? false)")
+        return executor.listFiles(path: arguments.path, glob: arguments.glob, recursive: arguments.recursive)
     }
 }
 
