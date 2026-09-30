@@ -10,6 +10,7 @@ public final class Agent: @unchecked Sendable {
     public let noTools: Bool
     public let executor: Executor
 
+    private let systemPrompt: String
     private var session: LanguageModelSession
     private let startTime: Date
     public private(set) var lastError: Bool = false
@@ -108,30 +109,47 @@ public final class Agent: @unchecked Sendable {
         self.executor = exec
 
         let prompt = Self.buildSystemPrompt(scopeDir: scopeDir ?? FileManager.default.currentDirectoryPath, readOnly: readOnly)
+        self.systemPrompt = prompt
+        self.session = LanguageModelSession(tools: [], instructions: prompt)
+        self.session = makeSession()
+    }
 
+    private func makeSession() -> LanguageModelSession {
         if noTools {
-            self.session = LanguageModelSession(
+            return LanguageModelSession(
                 tools: [],
-                instructions: prompt
+                instructions: systemPrompt
             )
         } else {
-            let bash = BashTool(executor: exec)
-            let readFile = ReadFileTool(executor: exec)
-            let searchFiles = SearchFilesTool(executor: exec)
-            let clarify = ClarifyTool(executor: exec)
+            let bash = BashTool(executor: executor)
+            let readFile = ReadFileTool(executor: executor)
+            let searchFiles = SearchFilesTool(executor: executor)
+            let clarify = ClarifyTool(executor: executor)
 
             var tools: [any Tool] = [bash, readFile, searchFiles, clarify]
             if !readOnly {
-                tools.append(WriteFileTool(executor: exec))
-                tools.append(EditFileTool(executor: exec))
-                tools.append(FileUndoTool(executor: exec))
+                tools.append(WriteFileTool(executor: executor))
+                tools.append(EditFileTool(executor: executor))
+                tools.append(FileUndoTool(executor: executor))
             }
 
-            self.session = LanguageModelSession(
+            return LanguageModelSession(
                 tools: tools,
-                instructions: prompt
+                instructions: systemPrompt
             )
         }
+    }
+
+    private static func isContextOverflow(_ error: Error) -> Bool {
+        if let genError = error as? LanguageModelSession.GenerationError {
+            switch genError {
+            case .exceededContextWindowSize:
+                return true
+            default:
+                break
+            }
+        }
+        return error.localizedDescription.lowercased().contains("context window")
     }
 
     public static func buildSystemPrompt(scopeDir: String, readOnly: Bool) -> String {
@@ -172,6 +190,7 @@ public final class Agent: @unchecked Sendable {
 
     public func run(userInput: String) async -> String {
         lastError = false
+        executor.resetTurnBudget()
         var currentPrompt = userInput
         var iterationCount = 0
 
@@ -228,6 +247,12 @@ public final class Agent: @unchecked Sendable {
                     attempted: currentPrompt,
                     error: errStr
                 )
+                if Self.isContextOverflow(error) {
+                    session = makeSession()
+                    executor.resetTurnBudget()
+                    FileHandle.standardError.write(Data("[context overflow: session reset — conversation history cleared]\n".utf8))
+                    return "Context window exceeded; the session was reset and prior conversation history is cleared. File changes already applied are NOT rolled back (file_undo history is kept) — check file state before retrying. Retry with a narrower request: smaller begin_line/end_line ranges and more specific search patterns."
+                }
                 return "Model session error: \(errStr)"
             }
         }

@@ -57,6 +57,27 @@ public final class Executor: @unchecked Sendable {
     // Larger context sizes scale to ~7,000 characters.
     // If the framework/API is unavailable, this safely falls back to the baseline of 3,000 characters.
     public let contextCharBudget: Int
+    public static let turnBudgetMultiplier = 2
+    public let turnOutputBudget: Int
+    private var turnOutputUsed: Int = 0
+
+    public func resetTurnBudget() {
+        turnOutputUsed = 0
+    }
+
+    private func budgeted(_ text: String) -> String {
+        let remaining = turnOutputBudget - turnOutputUsed
+        if text.count <= remaining {
+            turnOutputUsed += text.count
+            return text
+        }
+        if remaining >= 200 {
+            turnOutputUsed = turnOutputBudget
+            return String(text.prefix(remaining)) + "\n[output truncated: cumulative output budget for this turn reached (\(turnOutputBudget) chars). Do not request more large outputs; write your final answer from what you have.]"
+        }
+        turnOutputUsed = turnOutputBudget
+        return "[output withheld: cumulative output budget for this turn is exhausted (\(turnOutputBudget) chars). Stop calling tools and write your final answer from what you have.]"
+    }
 
     public static func detectContextCharBudget() -> Int {
         #if canImport(FoundationModels)
@@ -87,6 +108,7 @@ public final class Executor: @unchecked Sendable {
         self.interactive = interactive
         self.approval = Approval(scopeDir: self.scopeDir, interactive: interactive)
         self.contextCharBudget = contextCharBudget ?? Self.detectContextCharBudget()
+        self.turnOutputBudget = self.contextCharBudget * Self.turnBudgetMultiplier
 
         self.fileHistoryDir = URL(fileURLWithPath: self.brainDir).appendingPathComponent("file_history").path
 
@@ -316,7 +338,7 @@ public final class Executor: @unchecked Sendable {
 
         let fullOutput = stdoutStr.isEmpty ? "(no output)" : stdoutStr
         appendResultLog(toolName: "bash", label: command, output: fullOutput)
-        return truncateOutput(fullOutput)
+        return budgeted(truncateOutput(fullOutput))
     }
 
     // MARK: - Tool: read_file
@@ -420,7 +442,7 @@ public final class Executor: @unchecked Sendable {
         }
 
         appendResultLog(toolName: "read_file", label: resolved, output: "[ok: \(finalResult.count) chars]")
-        return finalResult
+        return budgeted(finalResult)
     }
 
     // MARK: - Tool: write_file
@@ -814,7 +836,7 @@ public final class Executor: @unchecked Sendable {
         } else {
             let out = header + "\n" + results.joined(separator: "\n")
             appendResultLog(toolName: "search_files", label: resolved, output: "[ok: \(matchCount) matches]")
-            return out
+            return budgeted(out)
         }
     }
 
