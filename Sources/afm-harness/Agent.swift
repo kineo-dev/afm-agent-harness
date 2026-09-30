@@ -140,6 +140,12 @@ public final class Agent: @unchecked Sendable {
         }
     }
 
+    private func resetSession() {
+        session = makeSession()
+        executor.resetTurnBudget()
+        executor.resetToolCallTracking()
+    }
+
     private static func isContextOverflow(_ error: Error) -> Bool {
         if let genError = error as? LanguageModelSession.GenerationError {
             switch genError {
@@ -191,6 +197,7 @@ public final class Agent: @unchecked Sendable {
     public func run(userInput: String) async -> String {
         lastError = false
         executor.resetTurnBudget()
+        executor.resetToolCallTracking()
         var currentPrompt = userInput
         var iterationCount = 0
 
@@ -247,9 +254,13 @@ public final class Agent: @unchecked Sendable {
                     attempted: currentPrompt,
                     error: errStr
                 )
+                if let reason = executor.loopAbortReason {
+                    resetSession()
+                    FileHandle.standardError.write(Data("[tool loop aborted: \(reason) — session reset]\n".utf8))
+                    return "Stopped: \(reason). The turn was aborted and the session was reset (conversation history cleared). File changes already applied are NOT rolled back (file_undo history is kept) — check file state before retrying. Retry with a narrower, more specific request; do not repeat the same tool call."
+                }
                 if Self.isContextOverflow(error) {
-                    session = makeSession()
-                    executor.resetTurnBudget()
+                    resetSession()
                     FileHandle.standardError.write(Data("[context overflow: session reset — conversation history cleared]\n".utf8))
                     return "Context window exceeded; the session was reset and prior conversation history is cleared. File changes already applied are NOT rolled back (file_undo history is kept) — check file state before retrying. Retry with a narrower request: smaller begin_line/end_line ranges and more specific search patterns."
                 }

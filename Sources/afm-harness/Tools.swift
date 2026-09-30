@@ -87,6 +87,7 @@ public struct BashTool: Tool, Sendable {
     }
 
     public func call(arguments: Arguments) async throws -> String {
+        try executor.registerToolCall(name: "bash", key: arguments.command)
         return executor.runBash(command: arguments.command, description: arguments.description)
     }
 }
@@ -158,6 +159,7 @@ public struct ReadFileTool: Tool, Sendable {
     }
 
     public func call(arguments: Arguments) async throws -> String {
+        try executor.registerToolCall(name: "read_file", key: "\(arguments.path)|\(arguments.begin_line ?? -1)|\(arguments.end_line ?? -1)")
         return executor.readFile(path: arguments.path, beginLine: arguments.begin_line, endLine: arguments.end_line)
     }
 }
@@ -226,6 +228,7 @@ public struct WriteFileTool: Tool, Sendable {
     }
 
     public func call(arguments: Arguments) async throws -> String {
+        try executor.registerToolCall(name: "write_file", key: "\(arguments.path)|\(arguments.content.count)")
         return executor.writeFile(path: arguments.path, content: arguments.content, dryRun: arguments.dry_run ?? false)
     }
 }
@@ -300,6 +303,7 @@ public struct EditFileTool: Tool, Sendable {
     }
 
     public func call(arguments: Arguments) async throws -> String {
+        try executor.registerToolCall(name: "edit_file", key: "\(arguments.path)|\(String(arguments.old_string.prefix(60)))|\(String(arguments.new_string.prefix(60)))|\(arguments.dry_run ?? false)")
         return executor.editFile(path: arguments.path, oldString: arguments.old_string, newString: arguments.new_string, dryRun: arguments.dry_run ?? false)
     }
 }
@@ -364,6 +368,7 @@ public struct FileUndoTool: Tool, Sendable {
     }
 
     public func call(arguments: Arguments) async throws -> String {
+        try executor.registerToolCall(name: "file_undo", key: "\(arguments.operation_id ?? "")|\(arguments.path ?? "")")
         return executor.undoFile(operationId: arguments.operation_id, path: arguments.path)
     }
 }
@@ -435,6 +440,7 @@ public struct SearchFilesTool: Tool, Sendable {
     }
 
     public func call(arguments: Arguments) async throws -> String {
+        try executor.registerToolCall(name: "search_files", key: "\(arguments.pattern)|\(arguments.path ?? "")|\(arguments.glob ?? "")")
         return executor.searchFiles(pattern: arguments.pattern, path: arguments.path, glob: arguments.glob)
     }
 }
@@ -507,6 +513,7 @@ public struct ClarifyTool: Tool, Sendable {
     }
 
     public func call(arguments: Arguments) async throws -> String {
+        try executor.registerToolCall(name: "clarify", key: arguments.question)
         return executor.clarify(question: arguments.question, options: arguments.options, allowMultiple: arguments.allow_multiple)
     }
 }

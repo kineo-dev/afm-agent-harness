@@ -79,6 +79,39 @@ public final class Executor: @unchecked Sendable {
         return "[output withheld: cumulative output budget for this turn is exhausted (\(turnOutputBudget) chars). Stop calling tools and write your final answer from what you have.]"
     }
 
+    // MARK: - Tool Loop Abort Tracking
+
+    public struct ToolLoopAbort: Error, LocalizedError, Sendable {
+        public let reason: String
+        public var errorDescription: String? { reason }
+    }
+    public static let maxIdenticalToolCalls = 3
+    public static let maxToolCallsPerRun = 15
+    private var toolCallCounts: [String: Int] = [:]
+    private var toolCallTotal: Int = 0
+    public private(set) var loopAbortReason: String? = nil
+    public func resetToolCallTracking() {
+        toolCallCounts = [:]
+        toolCallTotal = 0
+        loopAbortReason = nil
+    }
+    public func registerToolCall(name: String, key: String) throws {
+        toolCallTotal += 1
+        let sig = name + "|" + key
+        let n = (toolCallCounts[sig] ?? 0) + 1
+        toolCallCounts[sig] = n
+        if n >= Self.maxIdenticalToolCalls {
+            let r = "identical \(name) call repeated \(n) times (\(String(key.prefix(120))))"
+            loopAbortReason = r
+            throw ToolLoopAbort(reason: r)
+        }
+        if toolCallTotal > Self.maxToolCallsPerRun {
+            let r = "more than \(Self.maxToolCallsPerRun) tool calls in one turn (last: \(name))"
+            loopAbortReason = r
+            throw ToolLoopAbort(reason: r)
+        }
+    }
+
     public static func detectContextCharBudget() -> Int {
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
