@@ -1,6 +1,8 @@
 import Foundation
 
 public final class Approval: @unchecked Sendable {
+    public static let terminalLock = NSLock()
+    private let keysLock = NSLock()
     public let scopeDir: String?
     public let interactive: Bool
     private var alwaysAllowedKeys: Set<String> = []
@@ -277,8 +279,11 @@ public final class Approval: @unchecked Sendable {
             return true
         }
 
-        if let key = alwaysAllowKey, alwaysAllowedKeys.contains(key) {
-            return true
+        if let key = alwaysAllowKey {
+            let isAllowed = keysLock.withLock { alwaysAllowedKeys.contains(key) }
+            if isAllowed {
+                return true
+            }
         }
 
         // In non-interactive mode, write_file and edit_file within scope that are neither
@@ -296,40 +301,44 @@ public final class Approval: @unchecked Sendable {
             return false
         }
 
-        let cleanCmd = Self.sanitizeForTerminal(command)
-        let cleanDesc = Self.sanitizeForTerminal(description)
+        return Self.terminalLock.withLock {
+            let cleanCmd = Self.sanitizeForTerminal(command)
+            let cleanDesc = Self.sanitizeForTerminal(description)
 
-        FileHandle.standardError.write(Data("\n⚠️ APPROVAL REQUIRED:\n".utf8))
-        FileHandle.standardError.write(Data("  Description: \(cleanDesc)\n".utf8))
-        FileHandle.standardError.write(Data("  Command:     \(cleanCmd)\n".utf8))
+            FileHandle.standardError.write(Data("\n⚠️ APPROVAL REQUIRED:\n".utf8))
+            FileHandle.standardError.write(Data("  Description: \(cleanDesc)\n".utf8))
+            FileHandle.standardError.write(Data("  Command:     \(cleanCmd)\n".utf8))
 
-        if Self.isDestructive(command) {
-            FileHandle.standardError.write(Data("  🚨 WARNING: Contains destructive operation pattern!\n".utf8))
-        }
-        if Self.isSensitive(command) {
-            FileHandle.standardError.write(Data("  🔒 WARNING: Accesses sensitive/credential file path!\n".utf8))
-        }
-        if Self.isInstall(command) {
-            FileHandle.standardError.write(Data("  ⚙️ WARNING: Modifies environment or installs packages!\n".utf8))
-        }
-        if hasOutOfScopePath(command) {
-            FileHandle.standardError.write(Data("  🌐 WARNING: Accesses path outside designated scope!\n".utf8))
-        }
+            if Self.isDestructive(command) {
+                FileHandle.standardError.write(Data("  🚨 WARNING: Contains destructive operation pattern!\n".utf8))
+            }
+            if Self.isSensitive(command) {
+                FileHandle.standardError.write(Data("  🔒 WARNING: Accesses sensitive/credential file path!\n".utf8))
+            }
+            if Self.isInstall(command) {
+                FileHandle.standardError.write(Data("  ⚙️ WARNING: Modifies environment or installs packages!\n".utf8))
+            }
+            if hasOutOfScopePath(command) {
+                FileHandle.standardError.write(Data("  🌐 WARNING: Accesses path outside designated scope!\n".utf8))
+            }
 
-        FileHandle.standardError.write(Data("[y] Allow once, [a] Always allow this tool/path, [n] Deny: ".utf8))
+            FileHandle.standardError.write(Data("[y] Allow once, [a] Always allow this tool/path, [n] Deny: ".utf8))
 
-        guard let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            guard let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+                return false
+            }
+
+            if line == "y" || line == "yes" {
+                return true
+            } else if line == "a" || line == "always" {
+                if let key = alwaysAllowKey {
+                    keysLock.withLock {
+                        _ = alwaysAllowedKeys.insert(key)
+                    }
+                }
+                return true
+            }
             return false
         }
-
-        if line == "y" || line == "yes" {
-            return true
-        } else if line == "a" || line == "always" {
-            if let key = alwaysAllowKey {
-                alwaysAllowedKeys.insert(key)
-            }
-            return true
-        }
-        return false
     }
 }

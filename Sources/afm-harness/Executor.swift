@@ -16,7 +16,15 @@ public final class Executor: @unchecked Sendable {
     public let interactive: Bool
     public let approval: Approval
 
-    public private(set) var lastWasError: Bool = false
+    private let flagLock = NSLock()
+    private let historyLock = NSLock()
+    private let logLock = NSLock()
+
+    private var _lastWasError = false
+    public private(set) var lastWasError: Bool {
+        get { flagLock.withLock { _lastWasError } }
+        set { flagLock.withLock { _lastWasError = newValue } }
+    }
 
     public static let bashTimeout: TimeInterval = 60.0
     public static let maxBashOutputBytes: Int = 5 * 1024 * 1024 // 5MB
@@ -45,8 +53,16 @@ public final class Executor: @unchecked Sendable {
 
     // MARK: - Clarification State (clarify)
 
-    public private(set) var clarificationRequested: Bool = false
-    public private(set) var lastClarificationQuestion: String? = nil
+    private var _clarificationRequested = false
+    public private(set) var clarificationRequested: Bool {
+        get { flagLock.withLock { _clarificationRequested } }
+        set { flagLock.withLock { _clarificationRequested = newValue } }
+    }
+    private var _lastClarificationQuestion: String? = nil
+    public private(set) var lastClarificationQuestion: String? {
+        get { flagLock.withLock { _lastClarificationQuestion } }
+        set { flagLock.withLock { _lastClarificationQuestion = newValue } }
+    }
 
     // MARK: - Dynamic Context Size Detection
     //
@@ -164,63 +180,67 @@ public final class Executor: @unchecked Sendable {
     }
 
     public func writeEscalation(situation: String, attempted: String, error: String) {
-        ensureDirectoryPermissions(brainDir, mode: 0o700)
-        let files = (try? FileManager.default.contentsOfDirectory(atPath: brainDir)) ?? []
-        var maxNum = 0
-        for file in files {
-            if file.hasPrefix("escalation_report_") && file.hasSuffix(".md") {
-                let numPart = file.dropFirst("escalation_report_".count).dropLast(".md".count)
-                if let num = Int(numPart), num > maxNum {
-                    maxNum = num
+        logLock.withLock {
+            ensureDirectoryPermissions(brainDir, mode: 0o700)
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: brainDir)) ?? []
+            var maxNum = 0
+            for file in files {
+                if file.hasPrefix("escalation_report_") && file.hasSuffix(".md") {
+                    let numPart = file.dropFirst("escalation_report_".count).dropLast(".md".count)
+                    if let num = Int(numPart), num > maxNum {
+                        maxNum = num
+                    }
                 }
             }
+            let nextNum = maxNum + 1
+            let reportFilename = String(format: "escalation_report_%03d.md", nextNum)
+            let reportPath = URL(fileURLWithPath: brainDir).appendingPathComponent(reportFilename).path
+
+            let isoDate = ISO8601DateFormatter().string(from: Date())
+            let content = """
+            # Escalation Report
+
+            **Timestamp**: \(isoDate)
+
+            ## Situation
+            \(situation)
+
+            ## Attempted
+            \(attempted)
+
+            ## Error
+            \(error)
+
+            """
+
+            try? content.write(toFile: reportPath, atomically: true, encoding: .utf8)
+            chmod(reportPath, 0o600)
+            FileHandle.standardError.write(Data("\n⚠️ Escalation: \(reportPath)\n".utf8))
         }
-        let nextNum = maxNum + 1
-        let reportFilename = String(format: "escalation_report_%03d.md", nextNum)
-        let reportPath = URL(fileURLWithPath: brainDir).appendingPathComponent(reportFilename).path
-
-        let isoDate = ISO8601DateFormatter().string(from: Date())
-        let content = """
-        # Escalation Report
-
-        **Timestamp**: \(isoDate)
-
-        ## Situation
-        \(situation)
-
-        ## Attempted
-        \(attempted)
-
-        ## Error
-        \(error)
-
-        """
-
-        try? content.write(toFile: reportPath, atomically: true, encoding: .utf8)
-        chmod(reportPath, 0o600)
-        FileHandle.standardError.write(Data("\n⚠️ Escalation: \(reportPath)\n".utf8))
     }
 
     public func appendResultLog(toolName: String, label: String, output: String) {
-        ensureDirectoryPermissions(brainDir, mode: 0o700)
-        let logPath = URL(fileURLWithPath: brainDir).appendingPathComponent("results.log").path
-        let isoDate = ISO8601DateFormatter().string(from: Date())
-        let entry = """
-        ---
-        [\(isoDate)] \(toolName): \(label)
-        \(output)
+        logLock.withLock {
+            ensureDirectoryPermissions(brainDir, mode: 0o700)
+            let logPath = URL(fileURLWithPath: brainDir).appendingPathComponent("results.log").path
+            let isoDate = ISO8601DateFormatter().string(from: Date())
+            let entry = """
+            ---
+            [\(isoDate)] \(toolName): \(label)
+            \(output)
 
-        """
+            """
 
-        if !FileManager.default.fileExists(atPath: logPath) {
-            try? entry.write(toFile: logPath, atomically: true, encoding: .utf8)
-            chmod(logPath, 0o600)
-        } else if let handle = FileHandle(forWritingAtPath: logPath) {
-            handle.seekToEndOfFile()
-            if let data = entry.data(using: .utf8) {
-                handle.write(data)
+            if !FileManager.default.fileExists(atPath: logPath) {
+                try? entry.write(toFile: logPath, atomically: true, encoding: .utf8)
+                chmod(logPath, 0o600)
+            } else if let handle = FileHandle(forWritingAtPath: logPath) {
+                handle.seekToEndOfFile()
+                if let data = entry.data(using: .utf8) {
+                    handle.write(data)
+                }
+                try? handle.close()
             }
-            try? handle.close()
         }
     }
 
@@ -540,7 +560,9 @@ public final class Executor: @unchecked Sendable {
             try? FileManager.default.copyItem(atPath: resolved, toPath: backupDst)
             chmod(backupDst, 0o600)
         }
-        operationLog.append(FileOperationEntry(id: opId, path: resolved, backupFilename: backupName, hadPreviousContent: hadPrior, timestamp: Date()))
+        historyLock.withLock {
+            operationLog.append(FileOperationEntry(id: opId, path: resolved, backupFilename: backupName, hadPreviousContent: hadPrior, timestamp: Date()))
+        }
 
         // Atomic write via temporary file
         let tempUrl = URL(fileURLWithPath: parentDir).appendingPathComponent(".tmp_\(UUID().uuidString)")
@@ -637,7 +659,9 @@ public final class Executor: @unchecked Sendable {
         let backupDst = URL(fileURLWithPath: fileHistoryDir).appendingPathComponent(backupName).path
         try? FileManager.default.copyItem(atPath: resolved, toPath: backupDst)
         chmod(backupDst, 0o600)
-        operationLog.append(FileOperationEntry(id: opId, path: resolved, backupFilename: backupName, hadPreviousContent: true, timestamp: Date()))
+        historyLock.withLock {
+            operationLog.append(FileOperationEntry(id: opId, path: resolved, backupFilename: backupName, hadPreviousContent: true, timestamp: Date()))
+        }
 
         // Backup existing file to .bak
         let backupPath = resolved + ".bak"
@@ -675,35 +699,49 @@ public final class Executor: @unchecked Sendable {
             return out
         }
 
-        guard !operationLog.isEmpty else {
+        let hasEntries = historyLock.withLock { !operationLog.isEmpty }
+        guard hasEntries else {
             lastWasError = true
             let out = "Undo failed: no file operations recorded in this session."
             appendResultLog(toolName: "file_undo", label: "none", output: out)
             return out
         }
 
-        let targetIndex: Int?
-        if let opId = operationId, !opId.isEmpty {
-            targetIndex = operationLog.lastIndex(where: { $0.id == opId })
-        } else if let p = path, !p.isEmpty {
+        let resolvedPathForUndo: String?
+        if let p = path, !p.isEmpty {
             let (_, resolved) = validatePath(p)
-            targetIndex = operationLog.lastIndex(where: { $0.path == resolved })
+            resolvedPathForUndo = resolved
         } else {
-            targetIndex = operationLog.indices.last
+            resolvedPathForUndo = nil
         }
 
-        guard let idx = targetIndex else {
+        let removed = historyLock.withLock { () -> (entry: FileOperationEntry, idx: Int)? in
+            let targetIndex: Int?
+            if let opId = operationId, !opId.isEmpty {
+                targetIndex = operationLog.lastIndex(where: { $0.id == opId })
+            } else if let resolved = resolvedPathForUndo {
+                targetIndex = operationLog.lastIndex(where: { $0.path == resolved })
+            } else {
+                targetIndex = operationLog.indices.last
+            }
+            guard let idx = targetIndex else { return nil }
+            let entry = operationLog.remove(at: idx)
+            return (entry, idx)
+        }
+
+        guard let (entry, idx) = removed else {
             lastWasError = true
             let out = "Undo failed: no matching operation found in history."
             appendResultLog(toolName: "file_undo", label: operationId ?? path ?? "latest", output: out)
             return out
         }
 
-        let entry = operationLog.remove(at: idx)
         let desc = "undo operation \(entry.id) on \(entry.path)"
         if !approval.prompt(command: "write_file \(entry.path)", description: desc) {
             lastWasError = true
-            operationLog.insert(entry, at: idx)
+            historyLock.withLock {
+                operationLog.insert(entry, at: min(idx, operationLog.count))
+            }
             let out = "Undo denied by user."
             appendResultLog(toolName: "file_undo", label: entry.path, output: out)
             return out
@@ -889,29 +927,31 @@ public final class Executor: @unchecked Sendable {
         lastClarificationQuestion = question
 
         if interactive {
-            var promptStr = "\n❓ Clarification requested by agent:\n\(question)\n"
-            if let opts = options, !opts.isEmpty {
-                for (idx, opt) in opts.enumerated() {
-                    promptStr += "  [\(idx + 1)] \(opt)\n"
+            return Approval.terminalLock.withLock {
+                var promptStr = "\n❓ Clarification requested by agent:\n\(question)\n"
+                if let opts = options, !opts.isEmpty {
+                    for (idx, opt) in opts.enumerated() {
+                        promptStr += "  [\(idx + 1)] \(opt)\n"
+                    }
+                    promptStr += "Enter choice (1-\(opts.count) or custom text): "
+                } else {
+                    promptStr += "Your answer: "
                 }
-                promptStr += "Enter choice (1-\(opts.count) or custom text): "
-            } else {
-                promptStr += "Your answer: "
-            }
-            FileHandle.standardError.write(Data(promptStr.utf8))
+                FileHandle.standardError.write(Data(promptStr.utf8))
 
-            if let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
-                if let opts = options, let num = Int(line), num >= 1 && num <= opts.count {
-                    let chosen = opts[num - 1]
-                    appendResultLog(toolName: "clarify", label: question, output: "User selected: \(chosen)")
-                    return "User selected: \(chosen)"
+                if let line = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
+                    if let opts = options, let num = Int(line), num >= 1 && num <= opts.count {
+                        let chosen = opts[num - 1]
+                        appendResultLog(toolName: "clarify", label: question, output: "User selected: \(chosen)")
+                        return "User selected: \(chosen)"
+                    }
+                    appendResultLog(toolName: "clarify", label: question, output: "User replied: \(line)")
+                    return "User answer: \(line)"
                 }
-                appendResultLog(toolName: "clarify", label: question, output: "User replied: \(line)")
-                return "User answer: \(line)"
+                let defaultReply = "No answer provided by user. Proceed with best judgment."
+                appendResultLog(toolName: "clarify", label: question, output: defaultReply)
+                return defaultReply
             }
-            let defaultReply = "No answer provided by user. Proceed with best judgment."
-            appendResultLog(toolName: "clarify", label: question, output: defaultReply)
-            return defaultReply
         } else {
             let out = "No interactive user available. Proceeding with best judgment; state your assumption explicitly in the final answer."
             appendResultLog(toolName: "clarify", label: question, output: out)
