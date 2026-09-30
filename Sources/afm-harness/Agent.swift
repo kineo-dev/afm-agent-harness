@@ -61,8 +61,7 @@ public final class Agent: @unchecked Sendable {
        with write_file (or edit_file) rather than only stating it in a plain-text reply.
     8. When reading files, prefer begin_line/end_line for anything that might be large (source code,
        logs, documents). Do not read_file a whole file speculatively; use search_files or grep to locate relevant sections first.
-    9. When searching for files, text, or symbols across the workspace, prefer search_files over
-       piping find/grep in bash.
+    9. To find TEXT inside files, use search_files (it searches file contents only, never file names). To read a file whose path you know, use read_file directly. To list files, use bash with ls or find.
     10. For edit_file and write_file, you may specify dry_run: true to preview diffs before applying.
     11. If a previous file modification was erroneous, call file_undo to restore the prior state.
     12. If instructions are ambiguous or critical choices must be made, call clarify with

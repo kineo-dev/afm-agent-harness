@@ -910,7 +910,54 @@ public final class Executor: @unchecked Sendable {
             header += " [hit limit of \(maxMatches) matches]"
         }
         if results.isEmpty {
-            let out = "No matches found for '\(pattern)' in \(resolved)."
+            var nameMatches: [String] = []
+            let targetLastComponent = URL(fileURLWithPath: pattern).lastPathComponent
+
+            let literalUrl = URL(fileURLWithPath: resolved).appendingPathComponent(pattern).standardized
+            var literalIsReg: ObjCBool = false
+            if FileManager.default.fileExists(atPath: literalUrl.path, isDirectory: &literalIsReg), !literalIsReg.boolValue {
+                let resolvedPrefix = resolved.hasSuffix("/") ? resolved : resolved + "/"
+                let rel = literalUrl.path.hasPrefix(resolvedPrefix) ? String(literalUrl.path.dropFirst(resolvedPrefix.count)) : pattern
+                nameMatches.append(rel)
+            }
+
+            if isDir.boolValue && nameMatches.count < 3 {
+                let hintEnum = FileManager.default.enumerator(
+                    at: URL(fileURLWithPath: resolved),
+                    includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
+                    options: [.skipsPackageDescendants]
+                )
+                var hintCount = 0
+                let resolvedPrefix = resolved.hasSuffix("/") ? resolved : resolved + "/"
+                while let fileURL = hintEnum?.nextObject() as? URL {
+                    hintCount += 1
+                    if hintCount > 2000 || nameMatches.count >= 3 {
+                        break
+                    }
+                    let filename = fileURL.lastPathComponent
+                    if filename == ".git" || filename == ".build" || filename == "DerivedData" || filename == "brain" {
+                        hintEnum?.skipDescendants()
+                        continue
+                    }
+                    var isReg: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isReg), !isReg.boolValue {
+                        if filename == targetLastComponent {
+                            let rel = fileURL.path.hasPrefix(resolvedPrefix) ? String(fileURL.path.dropFirst(resolvedPrefix.count)) : filename
+                            if !nameMatches.contains(rel) {
+                                nameMatches.append(rel)
+                            }
+                        }
+                    }
+                }
+            }
+
+            var out = "No matches found for '\(pattern)' in \(resolved). Note: search_files matches file CONTENTS, not file names."
+            if !nameMatches.isEmpty {
+                let hits = nameMatches.prefix(3).joined(separator: ", ")
+                out += " A file with that name exists: \(hits) - open it with read_file."
+            } else {
+                out += " To list files use bash ls or find."
+            }
             appendResultLog(toolName: "search_files", label: resolved, output: out)
             return out
         } else {

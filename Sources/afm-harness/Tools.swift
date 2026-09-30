@@ -431,7 +431,7 @@ public struct SearchFilesTool: Tool, Sendable {
     public typealias Output = String
 
     public let name: String = "search_files"
-    public let description: String = "Search file contents across the workspace using regex or substring match with optional filename glob filter"
+    public let description: String = "Search INSIDE file contents for a text or regex (does not match file names). To open a known file path use read_file; to list files use bash ls or find."
     public var parameters: GenerationSchema { Arguments.generationSchema }
     public let executor: Executor
 
