@@ -155,7 +155,8 @@ public final class Agent: @unchecked Sendable {
                 break
             }
         }
-        return error.localizedDescription.lowercased().contains("context window")
+        let desc = error.localizedDescription.lowercased()
+        return desc.contains("context window") || (desc.contains("maximum allowed is") && desc.contains("tokens"))
     }
 
     public static func buildSystemPrompt(scopeDir: String, readOnly: Bool) -> String {
