@@ -62,10 +62,14 @@ public final class Executor: @unchecked Sendable {
     private var turnOutputUsed: Int = 0
 
     public func resetTurnBudget() {
+        toolStateLock.lock()
+        defer { toolStateLock.unlock() }
         turnOutputUsed = 0
     }
 
     private func budgeted(_ text: String) -> String {
+        toolStateLock.lock()
+        defer { toolStateLock.unlock() }
         let remaining = turnOutputBudget - turnOutputUsed
         if text.count <= remaining {
             turnOutputUsed += text.count
@@ -87,15 +91,20 @@ public final class Executor: @unchecked Sendable {
     }
     public static let maxIdenticalToolCalls = 3
     public static let maxToolCallsPerRun = 15
+    private let toolStateLock = NSLock()
     private var toolCallCounts: [String: Int] = [:]
     private var toolCallTotal: Int = 0
     public private(set) var loopAbortReason: String? = nil
     public func resetToolCallTracking() {
+        toolStateLock.lock()
+        defer { toolStateLock.unlock() }
         toolCallCounts = [:]
         toolCallTotal = 0
         loopAbortReason = nil
     }
     public func registerToolCall(name: String, key: String) throws {
+        toolStateLock.lock()
+        defer { toolStateLock.unlock() }
         toolCallTotal += 1
         let sig = name + "|" + key
         let n = (toolCallCounts[sig] ?? 0) + 1
