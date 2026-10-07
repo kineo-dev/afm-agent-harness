@@ -90,7 +90,7 @@ afm-agent-harness/
 `afm-harness` implements comprehensive defense-in-depth:
 
 1. **Auto-Approval (`SAFE_PREFIXES`)**: Read-only inspection commands (`ls`, `cat`, `grep`, `git status`, `git diff`, `df`, `free`, etc.) are approved immediately without prompting.
-2. **Operator & Injection Suppression**: Chaining (`&&`, `||`, `;`), redirection (`>`, `>>`, `<`), command substitution (`$()`, `` ` ``), parameter expansion (`${}`), and ANSI-C quoting (`$'...'`) outside single quotes are detected, disabling auto-approval.
+2. **Operator & Injection Suppression**: Chaining (`&&`, `||`, `;`), redirection (`>`, `>>`, `<`), command substitution (`$()`, `` ` ``), parameter expansion (`${}`), and ANSI-C quoting (`$'...'`) outside single quotes are detected, disabling auto-approval. Safe-prefix commands that can write via a flag or argument (e.g. `sort -o`, `--output=`, `uniq in out`) are likewise not auto-approved.
 3. **Restricted Child Environment**: `Process` child environments are stripped of parent secrets, retaining only minimal standard variables (`PATH`, `HOME`, `TERM`, `USER`, `LANG`, `LC_ALL`).
 4. **Symlink / TOCTOU Protection**: File operations employ `O_NOFOLLOW` and `stat` validation to prevent symlink traversal and FIFO hangs.
 5. **Atomic Writes**: File writes and edits write to temporary files before atomically replacing target files, accompanied by `.bak` backup retention.

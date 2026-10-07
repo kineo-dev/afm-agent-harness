@@ -116,6 +116,32 @@ public final class Approval: @unchecked Sendable {
         return false
     }
 
+    /// Some safe-prefix commands can still write a file: `sort -o FILE` / `--output=FILE`,
+    /// `git log/diff/show --output=FILE`, and `uniq IN OUT` (second positional is an output file).
+    public static func hasHiddenWriteFlag(_ command: String) -> Bool {
+        let tokens = command
+            .split { $0.isWhitespace }
+            .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "'\"")) }
+        guard let first = tokens.first else { return false }
+        let cmd = first.split(separator: "/").last.map(String.init) ?? first
+        let args = Array(tokens.dropFirst())
+        switch cmd {
+        case "sort":
+            return args.contains { tok in
+                if tok == "--output" || tok.hasPrefix("--output=") { return true }
+                // short flag or bundle containing 'o' (e.g. -o, -ro, -oFILE)
+                return tok.hasPrefix("-") && !tok.hasPrefix("--") && tok.dropFirst().contains("o")
+            }
+        case "git":
+            guard let sub = args.first, ["log", "diff", "show"].contains(sub) else { return false }
+            return args.dropFirst().contains { $0 == "--output" || $0.hasPrefix("--output=") }
+        case "uniq":
+            return args.filter { !$0.hasPrefix("-") }.count >= 2
+        default:
+            return false
+        }
+    }
+
     public static func isDestructive(_ command: String) -> Bool {
         destructivePatterns.contains { command.contains($0) }
     }
@@ -194,6 +220,7 @@ public final class Approval: @unchecked Sendable {
         if !isSafePrefix { return false }
 
         if Self.hasUnsafeOperators(stripped) { return false }
+        if Self.hasHiddenWriteFlag(stripped) { return false }
         if Self.isDestructive(stripped) { return false }
         if Self.isSensitive(stripped) { return false }
         if Self.isInstall(stripped) { return false }
