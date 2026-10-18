@@ -47,11 +47,52 @@ public final class Approval: @unchecked Sendable {
 
     public init(scopeDir: String? = nil, interactive: Bool = true) {
         if let dir = scopeDir, !dir.isEmpty {
-            self.scopeDir = (try? URL(fileURLWithPath: dir).resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? URL(fileURLWithPath: dir).standardized.path
+            self.scopeDir = Self.canonicalPath(URL(fileURLWithPath: dir))
         } else {
             self.scopeDir = nil
         }
         self.interactive = interactive
+    }
+
+    /// Pseudo-commands the file tools pass to `prompt`/`isDefinitelySafe` (e.g. "read_file /abs/path").
+    /// They are not shell commands and must never reach bash.
+    public static let internalCommands: [String] = ["read_file", "write_file", "edit_file"]
+
+    /// Splits an internal pseudo-command. The path is everything after the first space, so
+    /// paths containing spaces stay intact.
+    public static func parseInternalCommand(_ command: String) -> (name: String, path: String)? {
+        for name in internalCommands where command.hasPrefix(name + " ") {
+            return (name, String(command.dropFirst(name.count + 1)))
+        }
+        return nil
+    }
+
+    /// Resolves symlinks in the longest existing ancestor and re-appends the not-yet-existing tail,
+    /// so a path to a new file under a symlinked directory is judged by where it really lands.
+    public static func canonicalPath(_ url: URL) -> String {
+        var existing = url.standardized
+        var tail: [String] = []
+        while !FileManager.default.fileExists(atPath: existing.path) && existing.path != "/" {
+            tail.insert(existing.lastPathComponent, at: 0)
+            existing = existing.deletingLastPathComponent()
+        }
+        var base = (try? existing.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? existing.path
+        for component in tail {
+            base = (base as NSString).appendingPathComponent(component)
+        }
+        return base
+    }
+
+    /// Whitespace-split words with shell quoting/escaping removed, so `'-exec'` and `-\exec`
+    /// are compared as the program will see them (`-exec`).
+    private static func shellWords(_ command: String) -> [String] {
+        command.split { $0.isWhitespace }.map { word in
+            String(word.filter { $0 != "'" && $0 != "\"" && $0 != "\\" })
+        }
+    }
+
+    private static func isShortFlagBundle(_ token: String, containingAnyOf letters: String) -> Bool {
+        token.hasPrefix("-") && !token.hasPrefix("--") && token.dropFirst().contains { letters.contains($0) }
     }
 
     public static func sanitizeForTerminal(_ text: String) -> String {
@@ -119,9 +160,7 @@ public final class Approval: @unchecked Sendable {
     /// Some safe-prefix commands can still write a file: `sort -o FILE` / `--output=FILE`,
     /// `git log/diff/show --output=FILE`, and `uniq IN OUT` (second positional is an output file).
     public static func hasHiddenWriteFlag(_ command: String) -> Bool {
-        let tokens = command
-            .split { $0.isWhitespace }
-            .map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "'\"")) }
+        let tokens = shellWords(command)
         guard let first = tokens.first else { return false }
         let cmd = first.split(separator: "/").last.map(String.init) ?? first
         let args = Array(tokens.dropFirst())
@@ -129,14 +168,22 @@ public final class Approval: @unchecked Sendable {
         case "sort":
             return args.contains { tok in
                 if tok == "--output" || tok.hasPrefix("--output=") { return true }
+                // --compress-program runs an arbitrary program
+                if tok.hasPrefix("--compress-program") { return true }
                 // short flag or bundle containing 'o' (e.g. -o, -ro, -oFILE)
-                return tok.hasPrefix("-") && !tok.hasPrefix("--") && tok.dropFirst().contains("o")
+                return isShortFlagBundle(tok, containingAnyOf: "o")
             }
         case "git":
             guard let sub = args.first, ["log", "diff", "show"].contains(sub) else { return false }
             return args.dropFirst().contains { $0 == "--output" || $0.hasPrefix("--output=") }
         case "uniq":
             return args.filter { !$0.hasPrefix("-") }.count >= 2
+        case "tree":
+            // tree -o FILE writes the listing to FILE
+            return args.contains { isShortFlagBundle($0, containingAnyOf: "o") }
+        case "file":
+            // file -C compiles a magic file next to the input
+            return args.contains { $0 == "--compile" || isShortFlagBundle($0, containingAnyOf: "C") }
         default:
             return false
         }
@@ -178,27 +225,36 @@ public final class Approval: @unchecked Sendable {
         return paths
     }
 
-    public func hasOutOfScopePath(_ command: String) -> Bool {
+    private func isOutOfScope(path token: String) -> Bool {
         guard let scope = self.scopeDir, !scope.isEmpty else { return false }
         let scopeUrl = URL(fileURLWithPath: scope).standardized
-        let scopeCanonical = (try? scopeUrl.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? scopeUrl.path
+        let scopeCanonical = Self.canonicalPath(scopeUrl)
         let scopePrefix = scopeCanonical.hasSuffix("/") ? scopeCanonical : scopeCanonical + "/"
 
-        let tokens = Self.tokenizeForPaths(command)
-        for token in tokens {
-            let expanded = NSString(string: token).expandingTildeInPath
-            let candidateUrl = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded) : scopeUrl.appendingPathComponent(expanded)
-            let standardized = candidateUrl.standardized
-            let candidateCanonical = (try? standardized.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? standardized.path
+        let expanded = NSString(string: token).expandingTildeInPath
+        let candidateUrl = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded) : scopeUrl.appendingPathComponent(expanded)
+        let candidateCanonical = Self.canonicalPath(candidateUrl)
+        return candidateCanonical != scopeCanonical && !candidateCanonical.hasPrefix(scopePrefix)
+    }
 
-            if candidateCanonical != scopeCanonical && !candidateCanonical.hasPrefix(scopePrefix) {
-                return true
-            }
+    public func hasOutOfScopePath(_ command: String) -> Bool {
+        guard let scope = self.scopeDir, !scope.isEmpty else { return false }
+        // Internal pseudo-commands carry exactly one path, possibly containing spaces.
+        if let internalCommand = Self.parseInternalCommand(command) {
+            return isOutOfScope(path: internalCommand.path)
         }
-        return false
+        return Self.tokenizeForPaths(command).contains { isOutOfScope(path: $0) }
     }
 
     public func isDefinitelySafe(_ command: String) -> Bool {
+        // Internal read_file pseudo-command: safe iff the path is non-sensitive and in scope.
+        // (Never reaches bash: Executor.runBash rejects these names.)
+        if let internalCommand = Self.parseInternalCommand(command) {
+            return internalCommand.name == "read_file"
+                && !Self.isSensitive(internalCommand.path)
+                && !hasOutOfScopePath(command)
+        }
+
         let stripped = command.trimmingCharacters(in: .whitespacesAndNewlines)
         if stripped.isEmpty { return false }
 
@@ -226,43 +282,53 @@ public final class Approval: @unchecked Sendable {
         if Self.isInstall(stripped) { return false }
         if hasOutOfScopePath(stripped) { return false }
 
+        let words = Self.shellWords(stripped)
+
         // Mutating git operations are not safe
-        if stripped.hasPrefix("git branch") {
-            let tokens = stripped.split(separator: " ").map(String.init)
-            if tokens.contains("-d") || tokens.contains("-D") || tokens.contains("-m") || tokens.contains("-M") || tokens.contains("--delete") || tokens.contains("--move") {
-                return false
+        if words.first == "git", words.count >= 2 {
+            let sub = words[1]
+            let gitArgs = Array(words.dropFirst(2))
+            let positional = gitArgs.filter { !$0.hasPrefix("-") }
+            switch sub {
+            case "branch":
+                let listing = ["--list", "-l", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at"]
+                let mutating = ["--delete", "--move", "--copy", "--force", "--set-upstream-to", "--unset-upstream", "--edit-description"]
+                if gitArgs.contains(where: { mutating.contains($0) || $0.hasPrefix("--set-upstream-to=") || Self.isShortFlagBundle($0, containingAnyOf: "dDmMcCuf") }) {
+                    return false
+                }
+                // `git branch NAME` creates a branch
+                if !positional.isEmpty && !gitArgs.contains(where: { listing.contains($0) }) { return false }
+            case "tag":
+                let listing = ["--list", "-l", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at"]
+                let mutating = ["--delete", "--annotate", "--sign", "--local-user", "--force", "--message", "--file"]
+                if gitArgs.contains(where: { mutating.contains($0) || Self.isShortFlagBundle($0, containingAnyOf: "dasufmF") }) {
+                    return false
+                }
+                // `git tag NAME` creates a tag
+                if !positional.isEmpty && !gitArgs.contains(where: { listing.contains($0) || ($0.hasPrefix("-l")) }) { return false }
+            case "remote":
+                // only `git remote [-v]`, `show` and `get-url` are read-only (add/remove/rename/set-url/update/prune are not)
+                if let remoteSub = positional.first, !["show", "get-url"].contains(remoteSub) { return false }
+            case "config":
+                let mutating = ["--add", "--unset", "--unset-all", "--replace-all", "--edit", "-e", "--rename-section", "--remove-section"]
+                if !stripped.hasPrefix("git config --get") || gitArgs.contains(where: { mutating.contains($0) }) { return false }
+            default:
+                break
             }
         }
-        if stripped.hasPrefix("git remote") {
-            let tokens = stripped.split(separator: " ").map(String.init)
-            if tokens.contains("add") || tokens.contains("remove") || tokens.contains("rm") || tokens.contains("set-url") || tokens.contains("rename") {
-                return false
-            }
-        }
-        if stripped.hasPrefix("git config") && !stripped.hasPrefix("git config --get") {
-            return false
-        }
-        if stripped.hasPrefix("git tag") {
-            let tokens = stripped.split(separator: " ").map(String.init)
-            if tokens.contains("-d") || tokens.contains("--delete") || tokens.contains("-a") {
+
+        // Guard find against destructive flags (-delete, -exec, -execdir, -ok, -okdir, -fprint*)
+        if words.first == "find" {
+            let unsafeFind = ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fls", "-fprintf"]
+            if words.contains(where: { unsafeFind.contains($0) }) {
                 return false
             }
         }
 
-        // Guard find against destructive flags (-delete, -exec, -execdir, -ok, -okdir)
-        if stripped.hasPrefix("find ") || stripped == "find" {
-            let tokens = stripped.split(separator: " ").map(String.init)
-            let unsafeFind = ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls", "-fprintf"]
-            if tokens.contains(where: { unsafeFind.contains($0) }) {
-                return false
-            }
-        }
-
-        // Guard rg against mutating or unsafe flags
-        if stripped.hasPrefix("rg ") || stripped == "rg" {
-            let tokens = stripped.split(separator: " ").map(String.init)
-            let unsafeRg = ["--replace", "-r", "--passthru", "--pre", "--search-zip"]
-            if tokens.contains(where: { unsafeRg.contains($0) }) {
+        // Guard rg against flags that run programs (--pre, --hostname-bin) or rewrite output
+        if words.first == "rg" {
+            let unsafeRg = ["--replace", "-r", "--passthru", "--search-zip"]
+            if words.contains(where: { unsafeRg.contains($0) || $0.hasPrefix("--pre") || $0.hasPrefix("--hostname-bin") || $0.hasPrefix("--replace=") }) {
                 return false
             }
         }
@@ -316,8 +382,8 @@ public final class Approval: @unchecked Sendable {
         // In non-interactive mode, write_file and edit_file within scope that are neither
         // destructive nor sensitive are allowed by default (actual mutations are mechanically gated
         // by the --read-only flag in Executor).
-        if command.hasPrefix("write_file ") || command.hasPrefix("edit_file ") {
-            let isUnsafe = Self.isDestructive(command) || Self.isSensitive(command) || hasOutOfScopePath(command)
+        if let internalCommand = Self.parseInternalCommand(command), internalCommand.name != "read_file" {
+            let isUnsafe = Self.isDestructive(internalCommand.path) || Self.isSensitive(internalCommand.path) || hasOutOfScopePath(command)
             if !isUnsafe && !interactive {
                 return true
             }

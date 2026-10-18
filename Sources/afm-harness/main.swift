@@ -43,6 +43,11 @@ struct CLIOptions {
     var noTools: Bool = false
 }
 
+func failUsage(_ message: String) -> Never {
+    FileHandle.standardError.write(Data("afm-harness: \(message)\nTry 'afm-harness --help'.\n".utf8))
+    exit(2)
+}
+
 func parseCommandLine() -> CLIOptions {
     var options = CLIOptions()
     let args = CommandLine.arguments
@@ -52,15 +57,13 @@ func parseCommandLine() -> CLIOptions {
         let arg = args[i]
         switch arg {
         case "-p", "--prompt":
-            if i + 1 < args.count {
-                options.prompt = args[i + 1]
-                i += 1
-            }
+            guard i + 1 < args.count else { failUsage("option \(arg) requires a value") }
+            options.prompt = args[i + 1]
+            i += 1
         case "--scope":
-            if i + 1 < args.count {
-                options.scope = args[i + 1]
-                i += 1
-            }
+            guard i + 1 < args.count else { failUsage("option \(arg) requires a value") }
+            options.scope = args[i + 1]
+            i += 1
         case "--read-only":
             options.readOnly = true
         case "--no-tools":
@@ -68,10 +71,9 @@ func parseCommandLine() -> CLIOptions {
         case "--json":
             options.jsonOutput = true
         case "--brain-dir":
-            if i + 1 < args.count {
-                options.brainDir = args[i + 1]
-                i += 1
-            }
+            guard i + 1 < args.count else { failUsage("option \(arg) requires a value") }
+            options.brainDir = args[i + 1]
+            i += 1
         case "--no-cleanup":
             options.noCleanup = true
         case "-h", "--help":
@@ -90,7 +92,8 @@ func parseCommandLine() -> CLIOptions {
             """)
             exit(0)
         default:
-            break
+            // A silently ignored typo (e.g. --readonly) would run the agent without its safety flag.
+            failUsage("unknown option \(arg)")
         }
         i += 1
     }
