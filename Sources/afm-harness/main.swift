@@ -43,24 +43,32 @@ struct CLIOptions {
     var noTools: Bool = false
 }
 
+func failUsage(_ message: String) -> Never {
+    FileHandle.standardError.write(Data("afm-harness: \(message)\nTry 'afm-harness --help'.\n".utf8))
+    exit(2)
+}
+
 func parseCommandLine() -> CLIOptions {
     var options = CLIOptions()
     let args = CommandLine.arguments
     var i = 1
 
+    // A flag that needs a value must not silently fall through (e.g. `-p` with no text would
+    // otherwise start an interactive session), and an unknown flag must not be ignored
+    // (a typo like `--read-onyl` would silently drop a safety restriction).
+    func value(for flag: String) -> String {
+        guard i + 1 < args.count else { failUsage("option '\(flag)' requires a value") }
+        i += 1
+        return args[i]
+    }
+
     while i < args.count {
         let arg = args[i]
         switch arg {
         case "-p", "--prompt":
-            if i + 1 < args.count {
-                options.prompt = args[i + 1]
-                i += 1
-            }
+            options.prompt = value(for: arg)
         case "--scope":
-            if i + 1 < args.count {
-                options.scope = args[i + 1]
-                i += 1
-            }
+            options.scope = value(for: arg)
         case "--read-only":
             options.readOnly = true
         case "--no-tools":
@@ -68,10 +76,7 @@ func parseCommandLine() -> CLIOptions {
         case "--json":
             options.jsonOutput = true
         case "--brain-dir":
-            if i + 1 < args.count {
-                options.brainDir = args[i + 1]
-                i += 1
-            }
+            options.brainDir = value(for: arg)
         case "--no-cleanup":
             options.noCleanup = true
         case "-h", "--help":
@@ -90,7 +95,7 @@ func parseCommandLine() -> CLIOptions {
             """)
             exit(0)
         default:
-            break
+            failUsage("unknown option '\(arg)'")
         }
         i += 1
     }

@@ -126,8 +126,15 @@ public final class Approval: @unchecked Sendable {
         let cmd = first.split(separator: "/").last.map(String.init) ?? first
         let args = Array(tokens.dropFirst())
         switch cmd {
+        case "tree":
+            // tree -o FILE writes its listing to FILE
+            return args.contains { tok in
+                tok == "--output" || tok.hasPrefix("--output=") ||
+                    (tok.hasPrefix("-") && !tok.hasPrefix("--") && tok.dropFirst().contains("o"))
+            }
         case "sort":
             return args.contains { tok in
+                if tok.hasPrefix("--compress-program") { return true } // executes an arbitrary program
                 if tok == "--output" || tok.hasPrefix("--output=") { return true }
                 // short flag or bundle containing 'o' (e.g. -o, -ro, -oFILE)
                 return tok.hasPrefix("-") && !tok.hasPrefix("--") && tok.dropFirst().contains("o")
@@ -186,6 +193,8 @@ public final class Approval: @unchecked Sendable {
 
         let tokens = Self.tokenizeForPaths(command)
         for token in tokens {
+            // The shell would expand $VAR / $HOME to something we cannot verify here.
+            if token.contains("$") { return true }
             let expanded = NSString(string: token).expandingTildeInPath
             let candidateUrl = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded) : scopeUrl.appendingPathComponent(expanded)
             let standardized = candidateUrl.standardized
@@ -228,14 +237,23 @@ public final class Approval: @unchecked Sendable {
 
         // Mutating git operations are not safe
         if stripped.hasPrefix("git branch") {
-            let tokens = stripped.split(separator: " ").map(String.init)
-            if tokens.contains("-d") || tokens.contains("-D") || tokens.contains("-m") || tokens.contains("-M") || tokens.contains("--delete") || tokens.contains("--move") {
+            let args = stripped.split { $0.isWhitespace }.map(String.init).dropFirst(2)
+            let mutating: Set<String> = ["-d", "-D", "-m", "-M", "-c", "-C", "-f", "-u", "--delete", "--move", "--copy",
+                                         "--force", "--set-upstream-to", "--unset-upstream", "--edit-description"]
+            if args.contains(where: { mutating.contains($0) || $0.hasPrefix("--set-upstream-to=") }) {
+                return false
+            }
+            // `git branch NAME` creates a branch; positional args are only read-only when listing.
+            let listing: Set<String> = ["-l", "--list", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at"]
+            if args.contains(where: { !$0.hasPrefix("-") }) && !args.contains(where: { listing.contains($0) }) {
                 return false
             }
         }
         if stripped.hasPrefix("git remote") {
-            let tokens = stripped.split(separator: " ").map(String.init)
-            if tokens.contains("add") || tokens.contains("remove") || tokens.contains("rm") || tokens.contains("set-url") || tokens.contains("rename") {
+            // Allow only: bare/-v listing, `show`, and `get-url`; `update`, `prune`, `set-head`, etc. mutate or hit the network.
+            let args = stripped.split { $0.isWhitespace }.map(String.init).dropFirst(2)
+            let readOnlySubcommands: Set<String> = ["-v", "--verbose", "show", "get-url"]
+            if let first = args.first, !readOnlySubcommands.contains(first) {
                 return false
             }
         }
@@ -243,8 +261,12 @@ public final class Approval: @unchecked Sendable {
             return false
         }
         if stripped.hasPrefix("git tag") {
-            let tokens = stripped.split(separator: " ").map(String.init)
-            if tokens.contains("-d") || tokens.contains("--delete") || tokens.contains("-a") {
+            // `git tag NAME` creates a tag; only listing is read-only.
+            let args = stripped.split { $0.isWhitespace }.map(String.init).dropFirst(2)
+            let mutating: Set<String> = ["-d", "--delete", "-a", "-s", "-u", "-f", "--force", "-m", "-F", "-e"]
+            if args.contains(where: { mutating.contains($0) }) { return false }
+            let listing: Set<String> = ["-l", "--list", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at"]
+            if args.contains(where: { !$0.hasPrefix("-") }) && !args.contains(where: { listing.contains($0) }) {
                 return false
             }
         }
@@ -252,7 +274,7 @@ public final class Approval: @unchecked Sendable {
         // Guard find against destructive flags (-delete, -exec, -execdir, -ok, -okdir)
         if stripped.hasPrefix("find ") || stripped == "find" {
             let tokens = stripped.split(separator: " ").map(String.init)
-            let unsafeFind = ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls", "-fprintf"]
+            let unsafeFind = ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fls", "-fprintf"]
             if tokens.contains(where: { unsafeFind.contains($0) }) {
                 return false
             }

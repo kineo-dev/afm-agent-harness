@@ -8,6 +8,33 @@ import Glibc
 import FoundationModels
 #endif
 
+/// Thread-safe, size-capped byte sink used to drain a child process pipe concurrently.
+/// Bytes beyond `limit` are discarded (but still read) so the child never blocks on a full pipe.
+private final class CappedOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private let limit: Int
+
+    init(limit: Int) { self.limit = limit }
+
+    func append(_ chunk: Data) {
+        lock.withLock {
+            let room = limit - data.count
+            if room > 0 { data.append(chunk.prefix(room)) }
+        }
+    }
+
+    var snapshot: Data { lock.withLock { data } }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    func set() { lock.withLock { flag = true } }
+    var value: Bool { lock.withLock { flag } }
+}
+
 public final class Executor: @unchecked Sendable {
     public let sessionId: String
     public let brainDir: String
@@ -351,21 +378,40 @@ public final class Executor: @unchecked Sendable {
             return errStr
         }
 
+        // Drain stdout/stderr concurrently while the child runs. Waiting for exit before reading
+        // deadlocks once a pipe's buffer (~64KB) fills, because the child blocks on write.
+        let outBuf = CappedOutputBuffer(limit: Self.maxBashOutputBytes)
+        let errBuf = CappedOutputBuffer(limit: Self.maxBashOutputBytes)
+        let drainGroup = DispatchGroup()
+        for (reader, buf) in [(outPipe.fileHandleForReading, outBuf), (errPipe.fileHandleForReading, errBuf)] {
+            drainGroup.enter()
+            DispatchQueue.global().async {
+                while true {
+                    let chunk = reader.availableData
+                    if chunk.isEmpty { break }
+                    buf.append(chunk)
+                }
+                drainGroup.leave()
+            }
+        }
+
         // Timeout enforcement
         let pid = proc.processIdentifier
         let timer = DispatchSource.makeTimerSource()
-        var timedOut = false
+        let timedOut = LockedFlag()
         timer.schedule(deadline: .now() + Self.bashTimeout)
         timer.setEventHandler {
-            timedOut = true
+            timedOut.set()
             kill(pid, SIGKILL)
         }
         timer.resume()
 
         proc.waitUntilExit()
         timer.cancel()
+        // A grandchild may still hold the pipe open; don't hang on it.
+        _ = drainGroup.wait(timeout: .now() + 2)
 
-        if timedOut {
+        if timedOut.value {
             lastWasError = true
             let out = "Command timed out after \(Int(Self.bashTimeout)) seconds."
             writeEscalation(situation: "Bash command timed out", attempted: command, error: out)
@@ -373,15 +419,8 @@ public final class Executor: @unchecked Sendable {
             return out
         }
 
-        var outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        var errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-
-        if outData.count > Self.maxBashOutputBytes {
-            outData = outData.prefix(Self.maxBashOutputBytes)
-        }
-        if errData.count > Self.maxBashOutputBytes {
-            errData = errData.prefix(Self.maxBashOutputBytes)
-        }
+        let outData = outBuf.snapshot
+        let errData = errBuf.snapshot
 
         var stdoutStr = String(decoding: outData, as: UTF8.self)
         let stderrStr = String(decoding: errData, as: UTF8.self)
@@ -548,7 +587,12 @@ public final class Executor: @unchecked Sendable {
         }
 
         let parentDir = URL(fileURLWithPath: resolved).deletingLastPathComponent().path
-        ensureDirectoryPermissions(parentDir, mode: 0o755)
+        // Only create missing directories; never change permissions of an existing one.
+        try? FileManager.default.createDirectory(
+            atPath: parentDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
 
         // Record history entry before mutation for file_undo
         let opId = UUID().uuidString
@@ -568,15 +612,12 @@ public final class Executor: @unchecked Sendable {
         let tempUrl = URL(fileURLWithPath: parentDir).appendingPathComponent(".tmp_\(UUID().uuidString)")
         do {
             try content.write(to: tempUrl, atomically: true, encoding: .utf8)
-            let flags = O_WRONLY | O_NOFOLLOW
-            let fd = open(tempUrl.path, flags)
-            if fd >= 0 {
-                close(fd)
+            // rename(2) replaces the destination atomically; remove-then-move would lose the
+            // original if the move failed.
+            if rename(tempUrl.path, resolved) != 0 {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                              userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
             }
-            if FileManager.default.fileExists(atPath: resolved) {
-                try FileManager.default.removeItem(atPath: resolved)
-            }
-            try FileManager.default.moveItem(atPath: tempUrl.path, toPath: resolved)
         } catch {
             try? FileManager.default.removeItem(atPath: tempUrl.path)
             lastWasError = true
@@ -673,8 +714,10 @@ public final class Executor: @unchecked Sendable {
         let tempUrl = URL(fileURLWithPath: parentDir).appendingPathComponent(".tmp_edit_\(UUID().uuidString)")
         do {
             try updatedContent.write(to: tempUrl, atomically: true, encoding: .utf8)
-            try FileManager.default.removeItem(atPath: resolved)
-            try FileManager.default.moveItem(atPath: tempUrl.path, toPath: resolved)
+            if rename(tempUrl.path, resolved) != 0 {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                              userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
+            }
         } catch {
             try? FileManager.default.removeItem(atPath: tempUrl.path)
             lastWasError = true
@@ -837,6 +880,14 @@ public final class Executor: @unchecked Sendable {
 
             for prefix in Self.blockedPathPrefixes {
                 if filePath.hasPrefix(prefix) { return }
+            }
+
+            // Directory-level approval does not cover credential files or symlinks that
+            // point outside the approved directory, so never read those during a search.
+            let relForCheck = filePath.hasPrefix(resolved) ? String(filePath.dropFirst(resolved.count)) : filePath
+            if Approval.isSensitive(relForCheck) { return }
+            if (try? URL(fileURLWithPath: filePath).resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                return
             }
 
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)),
