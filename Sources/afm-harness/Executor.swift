@@ -159,9 +159,7 @@ public final class Executor: @unchecked Sendable {
         self.sessionId = sessionId ?? UUID().uuidString
         let base = brainBaseDir ?? "brain"
         self.brainDir = URL(fileURLWithPath: base).appendingPathComponent(self.sessionId).path
-        self.scopeDir = scopeDir.flatMap { dir in
-            (try? URL(fileURLWithPath: dir).resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? URL(fileURLWithPath: dir).standardized.path
-        }
+        self.scopeDir = scopeDir.map { Approval.canonicalPath(URL(fileURLWithPath: $0)) }
         self.readOnly = readOnly
         self.interactive = interactive
         self.approval = Approval(scopeDir: self.scopeDir, interactive: interactive)
@@ -177,6 +175,21 @@ public final class Executor: @unchecked Sendable {
     private func ensureDirectoryPermissions(_ path: String, mode: mode_t) {
         try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         chmod(path, mode)
+    }
+
+    /// Creates `path` (and parents) only if missing; never changes the mode of an existing directory.
+    private func createDirectoryIfMissing(_ path: String) {
+        guard !FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+    }
+
+    private func discardHistoryEntry(_ opId: String, backupName: String?) {
+        historyLock.withLock {
+            operationLog.removeAll { $0.id == opId }
+        }
+        if let name = backupName {
+            try? FileManager.default.removeItem(atPath: URL(fileURLWithPath: fileHistoryDir).appendingPathComponent(name).path)
+        }
     }
 
     public func writeEscalation(situation: String, attempted: String, error: String) {
@@ -252,12 +265,10 @@ public final class Executor: @unchecked Sendable {
         let expanded = NSString(string: trimmed).expandingTildeInPath
         let baseUrl = URL(fileURLWithPath: scopeDir ?? FileManager.default.currentDirectoryPath)
         let resolvedUrl = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded) : baseUrl.appendingPathComponent(expanded)
-        let standardized = resolvedUrl.standardized
-        let canonical = (try? standardized.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? standardized.path
+        let canonical = Approval.canonicalPath(resolvedUrl)
 
         for prefix in Self.blockedPathPrefixes {
-            let prefixUrl = URL(fileURLWithPath: prefix).standardized
-            let resolvedPrefix = (try? prefixUrl.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath) ?? prefixUrl.path
+            let resolvedPrefix = Approval.canonicalPath(URL(fileURLWithPath: prefix))
             if canonical == resolvedPrefix || canonical.hasPrefix(resolvedPrefix.hasSuffix("/") ? resolvedPrefix : resolvedPrefix + "/") {
                 return (false, "Path blocked: \(canonical) is under system directory \(prefix)")
             }
@@ -301,8 +312,44 @@ public final class Executor: @unchecked Sendable {
 
     // MARK: - Tool: bash
 
+    /// Reads to EOF, keeping at most `limit` bytes but always draining so the writer never blocks.
+    private static func drain(_ handle: FileHandle, limit: Int) -> Data {
+        var buffer = Data()
+        while true {
+            let chunk = handle.availableData
+            if chunk.isEmpty { break }
+            if buffer.count < limit {
+                buffer.append(chunk.prefix(limit - buffer.count))
+            }
+        }
+        return buffer
+    }
+
+    private final class ProcessCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var out = Data()
+        private var err = Data()
+        private var timedOut = false
+
+        func store(_ data: Data, isStderr: Bool) {
+            lock.withLock { if isStderr { err = data } else { out = data } }
+        }
+        func markTimedOut() { lock.withLock { timedOut = true } }
+        func snapshot() -> (Data, Data, Bool) { lock.withLock { (out, err, timedOut) } }
+    }
+
     public func runBash(command: String, description: String) -> String {
         lastWasError = false
+
+        // read_file/write_file/edit_file are approval pseudo-commands, not shell commands. Letting them
+        // through would let "write_file x; <anything>" ride the non-interactive write auto-approval.
+        if let firstWord = command.split(whereSeparator: { $0.isWhitespace }).first,
+           Approval.internalCommands.contains(String(firstWord)) {
+            lastWasError = true
+            let msg = "Command rejected: '\(firstWord)' is a dedicated tool, not a shell command. Call the \(firstWord) tool instead of bash."
+            appendResultLog(toolName: "bash", label: command, output: msg)
+            return msg
+        }
 
         if readOnly && !approval.isDefinitelySafe(command) {
             lastWasError = true
@@ -351,19 +398,34 @@ public final class Executor: @unchecked Sendable {
             return errStr
         }
 
+        // Drain both pipes while the process runs; waiting for exit first deadlocks once the
+        // child fills the ~64KB pipe buffer.
+        let capture = ProcessCapture()
+        let readers = DispatchGroup()
+        for (handle, isStderr) in [(outPipe.fileHandleForReading, false), (errPipe.fileHandleForReading, true)] {
+            readers.enter()
+            DispatchQueue.global().async {
+                capture.store(Self.drain(handle, limit: Self.maxBashOutputBytes), isStderr: isStderr)
+                readers.leave()
+            }
+        }
+
         // Timeout enforcement
         let pid = proc.processIdentifier
         let timer = DispatchSource.makeTimerSource()
-        var timedOut = false
         timer.schedule(deadline: .now() + Self.bashTimeout)
         timer.setEventHandler {
-            timedOut = true
-            kill(pid, SIGKILL)
+            capture.markTimedOut()
+            if proc.isRunning { kill(pid, SIGKILL) }
         }
         timer.resume()
 
         proc.waitUntilExit()
         timer.cancel()
+        // A backgrounded grandchild can keep the pipes open after bash exits; don't wait on it forever.
+        _ = readers.wait(timeout: .now() + 2)
+
+        let (outData, errData, timedOut) = capture.snapshot()
 
         if timedOut {
             lastWasError = true
@@ -371,16 +433,6 @@ public final class Executor: @unchecked Sendable {
             writeEscalation(situation: "Bash command timed out", attempted: command, error: out)
             appendResultLog(toolName: "bash", label: command, output: out)
             return out
-        }
-
-        var outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        var errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-
-        if outData.count > Self.maxBashOutputBytes {
-            outData = outData.prefix(Self.maxBashOutputBytes)
-        }
-        if errData.count > Self.maxBashOutputBytes {
-            errData = errData.prefix(Self.maxBashOutputBytes)
         }
 
         var stdoutStr = String(decoding: outData, as: UTF8.self)
@@ -548,7 +600,7 @@ public final class Executor: @unchecked Sendable {
         }
 
         let parentDir = URL(fileURLWithPath: resolved).deletingLastPathComponent().path
-        ensureDirectoryPermissions(parentDir, mode: 0o755)
+        createDirectoryIfMissing(parentDir)
 
         // Record history entry before mutation for file_undo
         let opId = UUID().uuidString
@@ -564,21 +616,18 @@ public final class Executor: @unchecked Sendable {
             operationLog.append(FileOperationEntry(id: opId, path: resolved, backupFilename: backupName, hadPreviousContent: hadPrior, timestamp: Date()))
         }
 
-        // Atomic write via temporary file
+        // Atomic write via temporary file; the original is never removed before the replacement is in place.
         let tempUrl = URL(fileURLWithPath: parentDir).appendingPathComponent(".tmp_\(UUID().uuidString)")
         do {
-            try content.write(to: tempUrl, atomically: true, encoding: .utf8)
-            let flags = O_WRONLY | O_NOFOLLOW
-            let fd = open(tempUrl.path, flags)
-            if fd >= 0 {
-                close(fd)
+            try content.write(to: tempUrl, atomically: false, encoding: .utf8)
+            if hadPrior {
+                _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: resolved), withItemAt: tempUrl)
+            } else {
+                try FileManager.default.moveItem(atPath: tempUrl.path, toPath: resolved)
             }
-            if FileManager.default.fileExists(atPath: resolved) {
-                try FileManager.default.removeItem(atPath: resolved)
-            }
-            try FileManager.default.moveItem(atPath: tempUrl.path, toPath: resolved)
         } catch {
             try? FileManager.default.removeItem(atPath: tempUrl.path)
+            discardHistoryEntry(opId, backupName: backupName)
             lastWasError = true
             let out = "Error writing file: \(error.localizedDescription)"
             appendResultLog(toolName: "write_file", label: resolved, output: out)
@@ -672,11 +721,11 @@ public final class Executor: @unchecked Sendable {
         let parentDir = URL(fileURLWithPath: resolved).deletingLastPathComponent().path
         let tempUrl = URL(fileURLWithPath: parentDir).appendingPathComponent(".tmp_edit_\(UUID().uuidString)")
         do {
-            try updatedContent.write(to: tempUrl, atomically: true, encoding: .utf8)
-            try FileManager.default.removeItem(atPath: resolved)
-            try FileManager.default.moveItem(atPath: tempUrl.path, toPath: resolved)
+            try updatedContent.write(to: tempUrl, atomically: false, encoding: .utf8)
+            _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: resolved), withItemAt: tempUrl)
         } catch {
             try? FileManager.default.removeItem(atPath: tempUrl.path)
+            discardHistoryEntry(opId, backupName: backupName)
             lastWasError = true
             let out = "Error writing edit: \(error.localizedDescription)"
             appendResultLog(toolName: "edit_file", label: resolved, output: out)
@@ -839,7 +888,14 @@ public final class Executor: @unchecked Sendable {
                 if filePath.hasPrefix(prefix) { return }
             }
 
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)),
+            // Don't follow file symlinks (they can point outside the approved directory) and don't
+            // read credential-like files just because their parent directory was approved.
+            let fileURL = URL(fileURLWithPath: filePath)
+            if (try? fileURL.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true { return }
+            let displayPath = filePath.hasPrefix(resolved) ? String(filePath.dropFirst(resolved.count)) : filePath
+            if Approval.isSensitive(displayPath) { return }
+
+            guard let data = try? Data(contentsOf: fileURL),
                   data.count <= Self.maxReadFileBytes,
                   let text = String(data: data, encoding: .utf8) else {
                 return
